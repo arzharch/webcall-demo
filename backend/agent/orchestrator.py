@@ -232,8 +232,8 @@ class ConversationOrchestrator:
                     await asyncio.sleep(0.1)  # Small delay for streaming effect
         
         except Exception as e:
-            logger.error(f"Orchestrator error: {e}")
-            error_response = "I apologize for the confusion. Could you please repeat that?"
+            logger.error(f"Orchestrator error: {e}", exc_info=True)
+            error_response = "I apologize, I'm having trouble processing that. Could you rephrase your request?"
             self.session.add_message(MessageRole.ASSISTANT, error_response)
             yield error_response
     

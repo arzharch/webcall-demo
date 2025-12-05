@@ -4,8 +4,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.tools import tool
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import StateGraph
-from langgraph.prebuilt import ToolNode
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode, tools_condition
 
 from agent.state import SessionState, update_session_state
 from agent.prompts import SYSTEM_PROMPT
@@ -54,78 +54,102 @@ class ConversationOrchestrator:
     """Manages the conversation flow using a LangGraph state machine."""
 
     def __init__(self):
-        self.settings = get_settings()
-        self.tools = [search_menu, get_restaurant_info, check_availability, create_reservation]
+        settings = get_settings()
         self.llm = ChatGoogleGenerativeAI(
-            model=self.settings.GEMINI_MODEL,
-            temperature=self.settings.TEMPERATURE,
-            google_api_key=self.settings.GEMINI_API_KEY,
-            convert_system_message_to_human=True
+            model=settings.GEMINI_MODEL,
+            temperature=settings.TEMPERATURE,
+            google_api_key=settings.GEMINI_API_KEY
         )
-        self.model_with_tools = self.llm.bind_tools(self.tools)
-        self.graph_app = self._build_graph()
-
+        
+        # Bind tools
+        self.tools = [search_menu, check_availability, create_reservation, get_restaurant_info]
+        self.llm_with_tools = self.llm.bind_tools(self.tools)
+        
+        # Build graph
+        self.graph = self._build_graph()
+        self.memory = MemorySaver()
+    
     def _build_graph(self):
         """Builds the LangGraph state machine."""
-        workflow = StateGraph(SessionState)
+        builder = StateGraph(SessionState)
 
-        # Node that calls the LLM
-        async def call_model(state: SessionState):
-            messages = state['messages']
-            # Pass call_id in the message to make it available to tools if needed
-            # A bit of a hack, but effective for PoCs
-            augmented_input = HumanMessage(content=messages[-1].content + f"\n\n[internal note: call_id is {state['call_id']}]")
-            response = await self.model_with_tools.ainvoke([SYSTEM_PROMPT] + messages[:-1] + [augmented_input])
-            return {"messages": [response]}
-
-        # Node that executes tools
-        tool_node = ToolNode(self.tools)
-
-        # Conditional edge logic
-        def should_continue(state: SessionState):
-            last_message = state['messages'][-1]
-            if last_message.tool_calls:
-                return "call_tool"
-            else:
-                return "end"
-
-        # Define the graph structure
-        workflow.add_node("agent", call_model)
-        workflow.add_node("call_tool", tool_node)
-        workflow.set_entry_point("agent")
-        workflow.add_conditional_edges(
-            "agent",
-            should_continue,
-            {"call_tool": "call_tool", "end": "__end__"},
-        )
-        workflow.add_edge("call_tool", "agent")
-
-        return workflow.compile(checkpointer=MemorySaver())
-
-    async def stream_response(self, session_id: str, user_message: str) -> AsyncIterator[str]:
-        """Processes a user message using the graph and streams the response."""
-        config = {"configurable": {"thread_id": session_id}}
-        inputs = {"messages": [HumanMessage(content=user_message)]}
-
-        # Stream events from the graph
-        async for event in self.graph_app.astream(inputs, config=config, stream_mode="updates"):
-            for value in event.values():
-                new_messages = value.get('messages', [])
-                if new_messages:
-                    # The final response from the agent is the last AIMessage
-                    last_message = new_messages[-1]
-                    if isinstance(last_message, AIMessage) and not last_message.tool_calls:
-                        yield last_message.content
+        def agent_node(state: SessionState):
+            # Convert to LangChain messages
+            messages = [
+                HumanMessage(content=m.content) if m.role == MessageRole.USER 
+                else AIMessage(content=m.content)
+                for m in state.messages
+            ]
+            
+            # Add system prompt
+            system_msg = HumanMessage(content=SYSTEM_PROMPT)
+            messages.insert(0, system_msg)
+            
+            # Call LLM
+            response = self.llm_with_tools.invoke(messages)
+            
+            # Add to state
+            state.messages.append(Message(
+                role=MessageRole.ASSISTANT,
+                content=response.content or "",
+                tool_calls=response.tool_calls if hasattr(response, 'tool_calls') else None
+            ))
+            
+            return state
         
-        # After streaming, update the persistent state
-        final_state = self.graph_app.get_state(config)
-        update_session_state(session_id, final_state.values)
-
-_orchestrator_instance = None
-
-def get_orchestrator() -> "ConversationOrchestrator":
-    """Returns a singleton instance of the ConversationOrchestrator."""
-    global _orchestrator_instance
-    if _orchestrator_instance is None:
-        _orchestrator_instance = ConversationOrchestrator()
-    return _orchestrator_instance
+        # Add nodes
+        builder.add_node("agent", agent_node)
+        builder.add_node("tools", ToolNode(self.tools))
+        
+        # Add edges
+        builder.add_edge(START, "agent")
+        builder.add_conditional_edges("agent", tools_condition)
+        builder.add_edge("tools", "agent")
+        
+        return builder.compile(checkpointer=self.memory)
+    
+    async def stream_response(self, session_id: str, user_message: str) -> AsyncIterator[str]:
+        """Stream response with proper sentence splitting for TTS"""
+        
+        # Get session state
+        state = get_session_state(session_id, session_id)
+        
+        # Add user message
+        state.messages.append(Message(
+            role=MessageRole.USER,
+            content=user_message
+        ))
+        
+        config = {"configurable": {"thread_id": session_id}}
+        
+        # Stream from graph
+        buffer = ""
+        async for event in self.graph.astream(state, config, stream_mode="updates"):
+            for node_name, node_output in event.items():
+                if node_name == "agent":
+                    # Extract message content
+                    if hasattr(node_output, 'messages'):
+                        latest = node_output.messages[-1]
+                        content = latest.content if hasattr(latest, 'content') else str(latest)
+                        
+                        # Stream sentence by sentence for TTS
+                        buffer += content
+                        
+                        # Split on sentence boundaries
+                        sentences = re.split(r'([.!?]+\s+)', buffer)
+                        
+                        for i in range(0, len(sentences) - 1, 2):
+                            if i + 1 < len(sentences):
+                                sentence = sentences[i] + sentences[i + 1]
+                                if sentence.strip():
+                                    yield sentence.strip()
+                        
+                        # Keep incomplete sentence in buffer
+                        buffer = sentences[-1] if len(sentences) % 2 == 1 else ""
+        
+        # Yield remaining buffer
+        if buffer.strip():
+            yield buffer.strip()
+        
+        # Update session state
+        update_session_state(session_id, state)

@@ -40,9 +40,21 @@ const VoiceCall: React.FC<VoiceCallProps> = ({ callId, onEnd }) => {
             setIsListening(true);
         };
 
-        socketRef.current.onmessage = (event) => {
-            // Receive audio response
-            playAudio(event.data);
+        socketRef.current.onmessage = async (event) => {
+            // Handle both JSON messages and binary audio
+            if (event.data instanceof Blob) {
+                // Audio response - play it
+                playAudio(await event.data.arrayBuffer());
+            } else {
+                // JSON transcript message
+                const message = JSON.parse(event.data);
+                if (message.type === 'transcript') {
+                    setTranscript(prev => [
+                        ...prev,
+                        `${message.role === 'user' ? 'You' : 'Maria'}: ${message.content}`
+                    ]);
+                }
+            }
         };
 
         socketRef.current.onerror = (error) => {

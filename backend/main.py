@@ -85,6 +85,26 @@ async def startup():
     
     print("✅ All services and background tasks are running.")
 
+# Pre-warm models on startup to avoid first-call latency
+@app.on_event("startup")
+async def warmup_models():
+    logger.info("🔥 Warming up models...")
+    
+    # Warm up TTS
+    tts = get_tts_service()
+    await tts.synthesize("Hello")
+    
+    # Warm up STT
+    stt = get_stt_service()
+    # Create dummy audio file for warm-up
+    
+    # Warm up LLM
+    orchestrator = get_orchestrator()
+    async for _ in orchestrator.stream_response("warmup", "test"):
+        break
+    
+    logger.info("✅ Models ready!")
+
 # --- REST Endpoints ---
 @app.get("/", tags=["Health"])
 async def health_check():
@@ -114,125 +134,73 @@ async def start_session():
 # --- Streaming WebSocket Endpoint ---
 @app.websocket("/ws/audio/{call_id}")
 async def websocket_audio_endpoint(websocket: WebSocket, call_id: str):
-    """WebSocket endpoint for audio streaming"""
+    """Complete voice conversation flow"""
     await websocket.accept()
+    logger.info(f"🎙️ WebSocket connected: {call_id}")
     
+    # Get services
+    stt = get_stt_service()
+    tts = get_tts_service()
+    orchestrator = get_orchestrator()
+    
+    # Initialize session
+    session_id = f"session_{call_id}"
     session = get_conversation(call_id)
-    orchestrator = ConversationOrchestrator(session)
     
-    logger.info(f"WebSocket connected: {call_id}")
+    # Send welcome message
+    welcome_text = "Hello! I'm Maria from Bella Cucina. How can I help you today?"
+    welcome_audio = await tts.synthesize(welcome_text)
+    await websocket.send_bytes(welcome_audio)
     
-    # Queues and Events for managing concurrent tasks
-    user_audio_queue = asyncio.Queue()
-    bot_response_queue = asyncio.Queue()
-    interruption_event = asyncio.Event()
-
-    async def audio_receiver():
-        """Receives audio from the client, performs VAD, and queues speech for transcription."""
-        audio_buffer = []
-        try:
-            while True:
-                data = await websocket.receive_bytes()
-                audio_buffer.append(data)
-
-                # Simple interruption: if the bot is talking, signal an interruption
-                if not bot_response_queue.empty():
-                    interruption_event.set()
-                    print("🎤 User interruption detected.")
-
-                # VAD processing
-                # This is a simplified VAD logic. A more robust implementation
-                # would use precise speech start/end timestamps from `get_speech_ts`.
-                audio_int16 = np.frombuffer(b"".join(audio_buffer), dtype=np.int16)
-                audio_float32 = audio_int16.astype(np.float32) / 32768.0
-                speech_prob = vad_model(torch.from_numpy(audio_float32), settings.SAMPLE_RATE).item()
-
-                if speech_prob < 0.5: # Threshold for silence
-                    if len(audio_buffer) > 1: # Avoid transcribing tiny silent chunks
-                        full_audio = b"".join(audio_buffer)
-                        await user_audio_queue.put(full_audio)
-                    audio_buffer.clear()
-
-        except WebSocketDisconnect:
-            print("Receiver: Client disconnected.")
-            await user_audio_queue.put(None) # Signal end to other tasks
-        except Exception as e:
-            print(f"Receiver Error: {e}")
-            await user_audio_queue.put(None)
-
-    async def response_handler():
-        """Processes user speech, gets a response from the agent, and queues it for sending."""
-        try:
-            while True:
-                audio_to_transcribe = await user_audio_queue.get()
-                if audio_to_transcribe is None:
-                    break # End signal
-
-                user_text = await stt_service.transcribe_audio(audio_to_transcribe)
-                if user_text:
-                    state.add_message(role="user", content=user_text)
-                    
-                    # Get a streaming response from the orchestrator
-                    text_stream = orchestrator.stream_response(state, user_text)
-                    
-                    # We put the entire stream generator into the queue
-                    await bot_response_queue.put(text_stream)
-
-                user_audio_queue.task_done()
-        except Exception as e:
-            print(f"Handler Error: {e}")
-
-    async def audio_sender():
-        """Streams the bot's audio response to the client, handling interruptions."""
-        try:
-            # Initial Greeting
-            initial_greeting = "Welcome to Bella Cucina. How can I help?"
-            state.add_message(role="assistant", content=initial_greeting)
-            async def initial_stream(): yield initial_greeting
-            audio_stream = tts_service.synthesize_streaming(initial_stream())
-            async for audio_chunk in audio_stream:
-                if interruption_event.is_set():
-                    print("Sender: Interruption detected, stopping greeting.")
-                    break
+    try:
+        while True:
+            # Receive audio from client
+            audio_data = await websocket.receive_bytes()
+            
+            # Transcribe
+            transcript = await stt.transcribe(audio_data)
+            
+            if not transcript or len(transcript.strip()) < 3:
+                continue  # Ignore very short/empty transcripts
+            
+            logger.info(f"User said: {transcript}")
+            
+            # Send transcript back to frontend
+            await websocket.send_json({
+                "type": "transcript",
+                "role": "user",
+                "content": transcript
+            })
+            
+            # Stream response from agent
+            full_response = ""
+            async for sentence in orchestrator.stream_response(session_id, transcript):
+                full_response += sentence + " "
+                
+                # Synthesize sentence
+                audio_chunk = await tts.synthesize(sentence)
+                
+                # Send audio to client
                 await websocket.send_bytes(audio_chunk)
-
-            # Main response loop
-            while True:
-                interruption_event.clear()
-                text_stream_generator = await bot_response_queue.get()
                 
-                full_response = ""
-                audio_stream = tts_service.synthesize_streaming(text_stream_generator)
-                async for audio_chunk in audio_stream:
-                    if interruption_event.is_set():
-                        print("Sender: Interruption detected, stopping playback.")
-                        # Clear the rest of the current response queue
-                        while not bot_response_queue.empty():
-                            bot_response_queue.get_nowait()
-                        break
-                    await websocket.send_bytes(audio_chunk)
-                
-                # The full text is not easily available here, this would require another refactor
-                # For now, we save an incomplete message.
-                if not interruption_event.is_set():
-                     state.add_message(role="assistant", content="<streaming_response>")
-                
-                bot_response_queue.task_done()
-                if user_audio_queue.empty() and websocket.client_state != 1:
-                    break
-
-        except Exception as e:
-            print(f"Sender Error: {e}")
-
-    # Run the concurrent tasks
-    receiver_task = asyncio.create_task(audio_receiver())
-    handler_task = asyncio.create_task(response_handler())
-    sender_task = asyncio.create_task(audio_sender())
-
-    await asyncio.gather(receiver_task, handler_task, sender_task)
+                # Also send text transcript
+                await websocket.send_json({
+                    "type": "transcript",
+                    "role": "assistant",
+                    "content": sentence
+                })
+            
+            logger.info(f"Assistant said: {full_response}")
     
-    print(f"🛑 WebSocket connection closing for call: {call_id}")
-    end_conversation(call_id)
+    except WebSocketDisconnect:
+        logger.info(f"Client disconnected: {call_id}")
+        end_conversation(call_id)
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}", exc_info=True)
+        try:
+            await websocket.close(code=1011, reason=str(e))
+        except:
+            pass
 
 # --- Uvicorn Runner ---
 if __name__ == "__main__":
