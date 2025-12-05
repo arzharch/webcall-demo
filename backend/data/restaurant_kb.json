@@ -1,0 +1,160 @@
+{
+  "restaurant_info": {
+    "name": "Bella Cucina",
+    "cuisine": "Italian",
+    "location": "123 Main Street, Downtown",
+    "phone": "(555) 123-4567",
+    "hours": {
+      "monday": "Closed",
+      "tuesday": "5:00 PM - 10:00 PM",
+      "wednesday": "5:00 PM - 10:00 PM",
+      "thursday": "5:00 PM - 10:00 PM",
+      "friday": "5:00 PM - 11:00 PM",
+      "saturday": "12:00 PM - 11:00 PM",
+      "sunday": "12:00 PM - 9:00 PM"
+    },
+    "policies": {
+      "reservation_required": true,
+      "cancellation_policy": "Please cancel at least 2 hours in advance",
+      "dress_code": "Smart casual",
+      "parking": "Valet parking available",
+      "max_party_size": 12
+    }
+  },
+  "menu": [
+    {
+      "id": "app_001",
+      "category": "Appetizers",
+      "name": "Bruschetta al Pomodoro",
+      "description": "Grilled bread topped with fresh tomatoes, basil, garlic, and olive oil",
+      "price": "$12",
+      "dietary": ["vegetarian"],
+      "popular": true
+    },
+    {
+      "id": "app_002",
+      "category": "Appetizers",
+      "name": "Calamari Fritti",
+      "description": "Lightly fried squid served with marinara sauce",
+      "price": "$14",
+      "dietary": [],
+      "popular": true
+    },
+    {
+      "id": "pasta_001",
+      "category": "Pasta",
+      "name": "Spaghetti Carbonara",
+      "description": "Classic Roman pasta with eggs, pancetta, pecorino cheese, and black pepper",
+      "price": "$18",
+      "dietary": [],
+      "popular": true
+    },
+    {
+      "id": "pasta_002",
+      "category": "Pasta",
+      "name": "Penne Arrabbiata",
+      "description": "Penne pasta in spicy tomato sauce with garlic and red chili peppers",
+      "price": "$16",
+      "dietary": ["vegetarian", "vegan-option"],
+      "popular": false
+    },
+    {
+      "id": "pasta_003",
+      "category": "Pasta",
+      "name": "Fettuccine Alfredo",
+      "description": "Fresh fettuccine in creamy parmesan sauce",
+      "price": "$17",
+      "dietary": ["vegetarian", "gluten-free-option"],
+      "popular": true
+    },
+    {
+      "id": "main_001",
+      "category": "Main Courses",
+      "name": "Osso Buco",
+      "description": "Braised veal shanks with vegetables, white wine, and broth",
+      "price": "$32",
+      "dietary": [],
+      "popular": true
+    },
+    {
+      "id": "main_002",
+      "category": "Main Courses",
+      "name": "Chicken Parmigiana",
+      "description": "Breaded chicken breast with marinara sauce and melted mozzarella",
+      "price": "$24",
+      "dietary": [],
+      "popular": true
+    },
+    {
+      "id": "main_003",
+      "category": "Main Courses",
+      "name": "Grilled Branzino",
+      "description": "Mediterranean sea bass grilled with lemon and herbs",
+      "price": "$28",
+      "dietary": ["gluten-free"],
+      "popular": false
+    },
+    {
+      "id": "pizza_001",
+      "category": "Pizza",
+      "name": "Margherita",
+      "description": "San Marzano tomatoes, fresh mozzarella, basil, and olive oil",
+      "price": "$16",
+      "dietary": ["vegetarian", "gluten-free-option"],
+      "popular": true
+    },
+    {
+      "id": "pizza_002",
+      "category": "Pizza",
+      "name": "Quattro Formaggi",
+      "description": "Four cheese pizza with mozzarella, gorgonzola, parmesan, and fontina",
+      "price": "$18",
+      "dietary": ["vegetarian"],
+      "popular": false
+    },
+    {
+      "id": "dessert_001",
+      "category": "Desserts",
+      "name": "Tiramisu",
+      "description": "Classic Italian dessert with espresso-soaked ladyfingers and mascarpone",
+      "price": "$10",
+      "dietary": ["vegetarian"],
+      "popular": true
+    },
+    {
+      "id": "dessert_002",
+      "category": "Desserts",
+      "name": "Panna Cotta",
+      "description": "Silky vanilla cream custard with berry compote",
+      "price": "$9",
+      "dietary": ["vegetarian", "gluten-free"],
+      "popular": true
+    }
+  ],
+  "faqs": [
+    {
+      "question": "Do you have vegetarian options?",
+      "answer": "Yes! We have several vegetarian dishes including Bruschetta, Penne Arrabbiata, Fettuccine Alfredo, and Margherita pizza. We can also modify many dishes to be vegetarian."
+    },
+    {
+      "question": "Do you accommodate gluten-free diets?",
+      "answer": "Absolutely! We offer gluten-free pasta options for our pasta dishes and gluten-free pizza crust. Several of our dishes are naturally gluten-free, like the Grilled Branzino."
+    },
+    {
+      "question": "Is parking available?",
+      "answer": "Yes, we offer complimentary valet parking for all our guests."
+    },
+    {
+      "question": "What is your cancellation policy?",
+      "answer": "We kindly request that you cancel your reservation at least 2 hours in advance if your plans change."
+    },
+    {
+      "question": "Can you accommodate large groups?",
+      "answer": "Yes, we can accommodate groups up to 12 people. For parties larger than 8, we recommend calling ahead to discuss special arrangements."
+    },
+    {
+      "question": "Do you have a dress code?",
+      "answer": "We have a smart casual dress code. We want you to feel comfortable while maintaining the elegant atmosphere of our restaurant."
+    }
+  ]
+}
