@@ -61,148 +61,153 @@ async def list_tickets():
 # --- Streaming WebSocket Endpoint ---
 @app.websocket("/ws/audio/{call_id}")
 async def websocket_audio_endpoint(websocket: WebSocket, call_id: str):
+    """
+    Handles the main voice conversation flow with real-time streaming,
+    interruption, and stateful VAD.
+    """
     await websocket.accept()
     print(f"🎙️ WebSocket connection established for call: {call_id}")
 
     session_id = f"session_{call_id}"
-    state = get_session_state(call_id, session_id)
-    
     stt_service = get_stt_service()
     tts_service = get_tts_service()
     orchestrator = get_orchestrator()
 
     # Queues and Events for managing concurrent tasks
-    user_audio_queue = asyncio.Queue()
+    user_speech_queue = asyncio.Queue()
     bot_response_queue = asyncio.Queue()
     interruption_event = asyncio.Event()
 
     async def audio_receiver():
-        """Receives audio from the client, performs VAD, and queues speech for transcription."""
-        audio_buffer = b""
-        # VAD specific components
-        # (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = vad_utils
+        """
+        Receives audio from the client, performs stateful VAD, and queues speech for transcription.
+        """
         vad_iterator = vad_utils.VADIterator(vad_model)
+        is_speaking = False
+        audio_buffer = []
+        # VAD Parameters
+        MIN_SILENCE_FRAMES = 15  # Corresponds to ~480ms of silence
+        SPEECH_THRESHOLD = 0.5
+        silence_frames = 0
         
-        # Adjust constants for VAD based on sample rate and chunk size (default 16kHz VAD model)
-        # Assuming `data` chunks are around 1 second or less.
-        MIN_SILENCE_DURATION_MS = 200 # milliseconds of silence to consider speech end
-        SPEECH_THRESHOLD = 0.5 # probability threshold for speech detection
-
         try:
             while True:
                 data = await websocket.receive_bytes()
-                
-                # Convert bytes to float32 numpy array for VAD
+                # The VAD model expects 16kHz audio chunks. 
+                # The size of `data` depends on the client's MediaRecorder `timeslice`.
+                # Assuming client sends chunks of 320-1600 bytes for 20-100ms latency.
                 audio_float32 = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
                 
-                # Process audio chunk with VADIterator
-                speech_prob = vad_iterator(audio_float32, return_seconds=True)
+                speech_prob = vad_iterator(torch.from_numpy(audio_float32), return_seconds=False)
                 
-                if speech_prob is not None:
-                    # speech_prob is a float indicating speech probability
-                    # A robust VAD should use `VADIterator` output, not just probability on a single chunk.
-                    # This is still a simplified VAD. For precise speech timestamps:
-                    # - Accumulate audio in `audio_buffer` until `vad_iterator.reset_states()` indicates end of speech
-                    # - Then put the full segment into `user_audio_queue`
-
-                    # Simplified VAD for now: If any speech activity, consider user speaking
-                    if speech_prob > SPEECH_THRESHOLD:
-                        audio_buffer += data
-                        # If bot is talking, interrupt it
+                if speech_prob['speech'] > SPEECH_THRESHOLD:
+                    # User is speaking
+                    silence_frames = 0
+                    if not is_speaking:
+                        is_speaking = True
+                        print("🎤 User speech started.")
                         if not bot_response_queue.empty():
-                            interruption_event.set()
-                            print("🎤 User interruption detected.")
-                    elif len(audio_buffer) > 0 and speech_prob < (1 - SPEECH_THRESHOLD):
-                        # User is silent and we have accumulated audio, process it
-                        full_audio_chunk = audio_buffer
-                        await user_audio_queue.put(full_audio_chunk)
-                        audio_buffer = b"" # Reset buffer
-                else: # VADIterator can return None if it's still buffering or no decision yet
-                    audio_buffer += data
-
+                             interruption_event.set()
+                             print("   - Interruption detected!")
+                    audio_buffer.append(data)
+                else:
+                    # User is silent
+                    if is_speaking:
+                        silence_frames += 1
+                        if silence_frames > MIN_SILENCE_FRAMES:
+                            is_speaking = False
+                            print("🎤 User speech ended.")
+                            full_audio_chunk = b"".join(audio_buffer)
+                            await user_speech_queue.put(full_audio_chunk)
+                            audio_buffer.clear()
+                            silence_frames = 0
         except WebSocketDisconnect:
             print("Receiver: Client disconnected.")
-            await user_audio_queue.put(None) # Signal end to other tasks
+            await user_speech_queue.put(None)
         except Exception as e:
             print(f"Receiver Error: {e}")
-            await user_audio_queue.put(None)
+            await user_speech_queue.put(None)
 
     async def response_handler():
-        """Processes user speech, gets a streaming response from the agent, and queues it for sending."""
+        """
+        Processes transcribed user speech, gets a streaming response from the
+        LangGraph agent, and puts the response stream and full text into a queue.
+        """
         try:
             while True:
-                audio_to_transcribe = await user_audio_queue.get()
+                audio_to_transcribe = await user_speech_queue.get()
                 if audio_to_transcribe is None:
-                    break # End signal
+                    await bot_response_queue.put(None) # Propagate end signal
+                    break
 
                 user_text = await stt_service.transcribe_audio(audio_to_transcribe)
                 if user_text:
-                    state.add_message(role="user", content=user_text)
+                    # Update state with user message
+                    update_session_state(session_id, {"messages": [HumanMessage(content=user_text)]})
                     
                     # Get a streaming response from the orchestrator
-                    text_stream_generator = orchestrator.stream_response(state, user_text)
+                    text_stream_generator = orchestrator.stream_response(session_id, user_text)
                     
-                    # We put the entire stream generator into the queue
+                    # Queue the response generator for the sender task
                     await bot_response_queue.put(text_stream_generator)
 
-                user_audio_queue.task_done()
+                user_speech_queue.task_done()
         except Exception as e:
             print(f"Handler Error: {e}")
 
     async def audio_sender():
-        """Streams the bot's audio response to the client, handling interruptions."""
+        """
+        Streams the bot's audio response to the client, handling interruptions and state updates.
+        """
         try:
             # Initial Greeting
             initial_greeting = "Welcome to Bella Cucina. How can I help?"
-            state.add_message(role="assistant", content=initial_greeting)
+            update_session_state(session_id, {"messages": [AIMessage(content=initial_greeting)]})
             async def initial_stream_gen(): yield initial_greeting
             audio_stream = tts_service.synthesize_streaming(initial_stream_gen())
             async for audio_chunk in audio_stream:
-                if interruption_event.is_set():
-                    print("Sender: Interruption detected, stopping greeting.")
-                    break
                 await websocket.send_bytes(audio_chunk)
 
             # Main response loop
             while True:
-                interruption_event.clear() # Clear event for the new response
-                text_stream_generator = await bot_response_queue.get()
+                response_stream = await bot_response_queue.get()
+                if response_stream is None:
+                    break # End signal
                 
-                collected_text = "" # To store the full bot response
-                audio_stream = tts_service.synthesize_streaming(text_stream_generator)
+                interruption_event.clear()
+                
+                # We need to consume the text stream to get the full response for history,
+                # while also passing it to the TTS service.
+                async def text_tee():
+                    full_response = ""
+                    async for chunk in response_stream:
+                        full_response += chunk
+                        yield chunk
+                    # After streaming is done, update the state with the full response
+                    update_session_state(session_id, {"messages": [AIMessage(content=full_response)]})
+                
+                text_generator = text_tee()
+                audio_stream = tts_service.synthesize_streaming(text_generator)
+
                 async for audio_chunk in audio_stream:
                     if interruption_event.is_set():
                         print("Sender: Interruption detected, stopping playback.")
-                        # Clear the rest of the current response queue
-                        while not bot_response_queue.empty():
-                            bot_response_queue.get_nowait()
+                        # Consume the rest of the audio stream to allow cleanup
+                        async for _ in audio_stream: pass
                         break
                     await websocket.send_bytes(audio_chunk)
                 
-                # After sending audio, collect the full text that was sent
-                # This requires a way to collect the text from text_stream_generator.
-                # A more robust solution might involve sending (text, audio_chunk) pairs
-                # from the orchestrator to the bot_response_queue.
-                # For now, we save an incomplete message.
-                if not interruption_event.is_set():
-                    state.add_message(role="assistant", content=collected_text if collected_text else "<streaming_response_completed>")
-                
                 bot_response_queue.task_done()
-                if user_audio_queue.empty() and websocket.client_state != 1:
-                    break # Consider breaking only if session truly ended.
 
         except Exception as e:
             print(f"Sender Error: {e}")
 
     # Run the concurrent tasks
-    receiver_task = asyncio.create_task(audio_receiver())
-    handler_task = asyncio.create_task(response_handler())
-    sender_task = asyncio.create_task(audio_sender())
-
+    tasks = [audio_receiver(), response_handler(), audio_sender()]
     try:
-        await asyncio.gather(receiver_task, handler_task, sender_task)
+        await asyncio.gather(*tasks)
     except Exception as e:
-        print(f"Tasks gathering error: {e}")
+        print(f"Core WebSocket task gathering error: {e}")
     finally:
         print(f"🛑 WebSocket connection closing for call: {call_id}")
         end_session(session_id)
