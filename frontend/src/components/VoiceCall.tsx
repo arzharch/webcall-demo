@@ -7,137 +7,159 @@ interface VoiceCallProps {
 }
 
 const VoiceCall: React.FC<VoiceCallProps> = ({ callId, onEnd }) => {
-    const [isRecording, setIsRecording] = useState(false);
     const [transcript, setTranscript] = useState<string[]>([]);
-    const [isListening, setIsListening] = useState(true);
     const [status, setStatus] = useState('Connecting...');
 
-    const socketRef = useRef<WebSocket | null>(null);
-    const mediaStreamRef = useRef<MediaStream | null>(null);
-    const audioContextRef = useRef<AudioContext | null>(null);
-    const processorRef = useRef<ScriptProcessorAudioNode | null>(null);
+    const webrtcSocketRef = useRef<WebSocket | null>(null);
+    const transcriptSocketRef = useRef<WebSocket | null>(null);
+    const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+    const localStreamRef = useRef<MediaStream | null>(null);
+    const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
 
     useEffect(() => {
-        connectWebSocket();
-        initializeAudio();
+        initializeCall();
 
         return () => {
-            if (socketRef.current) {
-                socketRef.current.close();
-            }
-            if (mediaStreamRef.current) {
-                mediaStreamRef.current.getTracks().forEach(track => track.stop());
-            }
+            cleanup();
         };
     }, [callId]);
 
-    const connectWebSocket = () => {
-        const wsUrl = `ws://localhost:8000/ws/audio/${callId}`;
-        socketRef.current = new WebSocket(wsUrl);
+    const initializeCall = async () => {
+        await initializeAudio();
+        connectWebRTC();
+        connectTranscript();
+    };
 
-        socketRef.current.onopen = () => {
-            setStatus('Connected');
-            setIsListening(true);
-        };
-
-        socketRef.current.onmessage = async (event) => {
-            // Handle both JSON messages and binary audio
-            if (event.data instanceof Blob) {
-                // Audio response - play it
-                playAudio(await event.data.arrayBuffer());
-            } else {
-                // JSON transcript message
-                const message = JSON.parse(event.data);
-                if (message.type === 'transcript') {
-                    setTranscript(prev => [
-                        ...prev,
-                        `${message.role === 'user' ? 'You' : 'Maria'}: ${message.content}`
-                    ]);
-                }
-            }
-        };
-
-        socketRef.current.onerror = (error) => {
-            console.error('WebSocket error:', error);
-            setStatus('Connection error');
-        };
-
-        socketRef.current.onclose = () => {
-            setStatus('Disconnected');
-            setIsListening(false);
-        };
+    const cleanup = () => {
+        if (webrtcSocketRef.current) {
+            webrtcSocketRef.current.close();
+        }
+        if (transcriptSocketRef.current) {
+            transcriptSocketRef.current.close();
+        }
+        if (peerConnectionRef.current) {
+            peerConnectionRef.current.close();
+        }
+        if (localStreamRef.current) {
+            localStreamRef.current.getTracks().forEach(track => track.stop());
+        }
     };
 
     const initializeAudio = async () => {
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            mediaStreamRef.current = stream;
-
-            // Proper AudioContext initialization
-            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-            const audioContext = new AudioContextClass();
-            audioContextRef.current = audioContext;
-            
-            const source = audioContext.createMediaStreamSource(stream);
-            const processor = audioContext.createScriptProcessor(4096, 1, 1);
-            processorRef.current = processor;
-
-            source.connect(processor);
-            processor.connect(audioContext.destination);
-
-            processor.onaudioprocess = (event) => {
-                if (isListening && socketRef.current?.readyState === WebSocket.OPEN) {
-                    const audioData = event.inputBuffer.getChannelData(0);
-                    const pcmData = new Int16Array(audioData.length);
-                    
-                    for (let i = 0; i < audioData.length; i++) {
-                        pcmData[i] = Math.max(-1, Math.min(1, audioData[i])) * 0x7FFF;
-                    }
-
-                    socketRef.current.send(pcmData.buffer);
-                }
-            };
-
-            setStatus('Listening...');
+            const stream = await navigator.mediaDevices.getUserMedia({ 
+                audio: {
+                    channelCount: 1,
+                    sampleRate: 16000,
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true
+                } 
+            });
+            localStreamRef.current = stream;
         } catch (error) {
-            console.error('Audio initialization error:', error);
+            console.error('Failed to initialize audio:', error);
             setStatus('Microphone access denied');
         }
     };
 
-    const playAudio = (audioBuffer: ArrayBuffer) => {
-        if (!audioContextRef.current) return;
-
-        const audioContext = audioContextRef.current;
-        audioContext.decodeAudioData(audioBuffer, (audioBuffer) => {
-            const source = audioContext.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(audioContext.destination);
-            source.start(0);
+    const connectWebRTC = () => {
+        const pc = new RTCPeerConnection({
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
         });
+        peerConnectionRef.current = pc;
+
+        localStreamRef.current?.getTracks().forEach(track => {
+            pc.addTrack(track, localStreamRef.current!);
+        });
+
+        pc.ontrack = (event) => {
+            if (remoteAudioRef.current) {
+                remoteAudioRef.current.srcObject = event.streams[0];
+            }
+        };
+
+        const wsUrl = `ws://localhost:8000/ws/webrtc/${callId}`;
+        const ws = new WebSocket(wsUrl);
+        webrtcSocketRef.current = ws;
+
+        ws.onopen = async () => {
+            console.log('WebRTC signaling connected');
+            setStatus('Establishing connection...');
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
+        };
+
+        ws.onmessage = async (event) => {
+            const data = JSON.parse(event.data);
+            if (data.type === 'answer') {
+                const answer = new RTCSessionDescription(data);
+                await pc.setRemoteDescription(answer);
+            } else if (data.type === 'candidate') {
+                await pc.addIceCandidate(data.candidate);
+            }
+        };
+
+        pc.onicecandidate = (event) => {
+            if (event.candidate) {
+                ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate.toJSON() }));
+            }
+        };
+    };
+
+    const connectTranscript = () => {
+        const wsUrl = `ws://localhost:8000/ws/transcript/${callId}`;
+        const ws = new WebSocket(wsUrl);
+        transcriptSocketRef.current = ws;
+
+        ws.onopen = () => {
+            console.log('Transcript WebSocket connected');
+            setStatus('Connected');
+            // This is where you would send the user's transcribed speech
+            // For now, we'll just log a message
+            console.log("Ready to send/receive transcripts.");
+        };
+
+        ws.onmessage = (event) => {
+            const message = JSON.parse(event.data);
+            if (message.type === 'transcript') {
+                const speaker = message.role === 'user' ? 'You' : 'Maria';
+                setTranscript(prev => [...prev, `${speaker}: ${message.content}`]);
+            }
+        };
+
+        ws.onerror = (error) => {
+            console.error('Transcript WebSocket error:', error);
+        };
+
+        ws.onclose = () => {
+            console.log('Transcript WebSocket disconnected');
+        };
     };
 
     return (
         <div className="voice-call">
             <div className="call-status">
-                <div className={`status-indicator ${isListening ? 'active' : ''}`}></div>
-                <span className="status-text">{status}</span>
+                <div className={`status-indicator ${status.includes('Connected') ? 'active' : ''}`}></div>
             </div>
 
             <div className="transcript-box">
                 <h3>Conversation</h3>
                 <div className="transcript-content">
                     {transcript.length === 0 ? (
-                        <p className="empty-text">Listening for your voice...</p>
+                        <p className="empty-text">Conversation will appear here...</p>
                     ) : (
-                        transcript.map((line, idx) => (
-                            <p key={idx} className="transcript-line">
+                        transcript.map((line, index) => (
+                            <div key={index} className="transcript-line">
                                 {line}
-                            </p>
+                            </div>
                         ))
                     )}
                 </div>
             </div>
+
+            <audio ref={remoteAudioRef} autoPlay />
 
             <button className="end-call-button" onClick={onEnd}>
                 End Call

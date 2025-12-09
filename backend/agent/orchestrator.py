@@ -1,117 +1,229 @@
-from typing import AsyncIterator
 import json
+import logging
+import random
+import re
+from typing import AsyncIterator
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.tools import tool
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode, tools_condition
 
-from agent.state import SessionState
+from agent.state import SessionState, get_session_state, update_session_state
 from agent.prompts import SYSTEM_PROMPT
 from config import get_settings
 from services.rag_service import get_rag_service
 from services.crm_service import get_crm_service
-from models import BookingIntent
+from models import BookingIntent, MessageRole, Message
+
+logger = logging.getLogger(__name__)
+settings = get_settings()
 
 # --- Tools Definition ---
-# These tools are the interface between the agent and the outside world.
-
 @tool
 async def search_menu(query: str) -> str:
     """Searches the restaurant's menu for specific dishes, ingredients, or dietary options."""
-    rag_service = get_rag_service()
-    results = await rag_service.search(query=query, top_k=3)
-    return json.dumps([r.dict() for r in results]) if results else "No relevant menu items found."
+    try:
+        rag_service = get_rag_service()
+        results = await rag_service.search_menu(query, top_k=3)
+        if results:
+            items = []
+            for r in results:
+                items.append(f"{r.metadata.get('name', 'Item')}: {r.content} - {r.metadata.get('price', 'N/A')}")
+            return "\n".join(items)
+        return "No matching menu items found."
+    except Exception as e:
+        logger.error(f"search_menu error: {e}")
+        return "Unable to search menu at this time."
 
 @tool
 async def get_restaurant_info(topic: str) -> str:
     """Finds general information about the restaurant (e.g., hours, location, policies)."""
-    rag_service = get_rag_service()
-    results = await rag_service.search(query=topic, top_k=2)
-    return "\n".join([r.content for r in results]) if results else "No information found on that topic."
+    try:
+        rag_service = get_rag_service()
+        info = await rag_service.get_restaurant_info(topic)
+        return info if info else "I don't have that information right now."
+    except Exception as e:
+        logger.error(f"get_restaurant_info error: {e}")
+        return "Unable to retrieve restaurant info at this time."
 
 @tool
 async def check_availability(date: str, time: str, party_size: int) -> str:
     """Checks for table availability."""
-    if party_size > 12:
-        return json.dumps({"available": False, "reason": "For parties larger than 12, please call the restaurant directly."}))
-    import random
-    available = random.random() < 0.8
-    return json.dumps({"available": available})
+    try:
+        if party_size > 12:
+            return json.dumps({"available": False, "reason": "Party size exceeds maximum of 12"})
+        
+        # Simulate availability check (80% chance of availability)
+        available = random.random() < 0.8
+        return json.dumps({
+            "available": available,
+            "date": date,
+            "time": time,
+            "party_size": party_size
+        })
+    except Exception as e:
+        logger.error(f"check_availability error: {e}")
+        return json.dumps({"available": False, "reason": "Error checking availability"})
 
 @tool
 async def create_reservation(date: str, time: str, party_size: int, customer_name: str, call_id: str) -> str:
     """Creates a confirmed reservation and a CRM ticket."""
-    crm_service = get_crm_service()
-    booking_intent = BookingIntent(date=date, time=time, party_size=party_size, customer_name=customer_name)
-    ticket = await crm_service.create_ticket_from_intent(booking_intent, call_id=call_id)
-    return json.dumps({"status": "success", "confirmation_id": ticket.id})
+    try:
+        crm_service = get_crm_service()
+        
+        # Create booking intent
+        booking = BookingIntent(
+            date=date,
+            time=time,
+            party_size=party_size,
+            customer_name=customer_name
+        )
+        
+        # Create ticket
+        ticket = await crm_service.create_ticket_from_intent(
+            booking_intent=booking,
+            call_id=call_id,
+            summary=f"Reservation for {customer_name}, party of {party_size}"
+        )
+        
+        return json.dumps({
+            "success": True,
+            "confirmation_number": ticket.id,
+            "details": {
+                "name": customer_name,
+                "date": date,
+                "time": time,
+                "party_size": party_size
+            }
+        })
+    except Exception as e:
+        logger.error(f"create_reservation error: {e}")
+        return json.dumps({"success": False, "error": "Failed to create reservation"})
 
-# --- Graph Definition ---
-
+# --- Orchestrator ---
 class ConversationOrchestrator:
-    """Manages the conversation flow using a LangGraph state machine."""
+    """Manages the conversation flow using LangGraph state machine."""
 
     def __init__(self):
-        settings = get_settings()
-        self.tools = [search_menu, get_restaurant_info, check_availability, create_reservation]
-        llm = ChatGoogleGenerativeAI(
-            model=settings.GEMINI_MODEL,
-            temperature=settings.TEMPERATURE,
-            google_api_key=settings.GEMINI_API_KEY,
-            convert_system_message_to_human=True
+        self.settings = get_settings()
+        self.llm = ChatGoogleGenerativeAI(
+            model=self.settings.GEMINI_MODEL,
+            temperature=self.settings.TEMPERATURE,
+            google_api_key=self.settings.GEMINI_API_KEY,
+            max_output_tokens=self.settings.MAX_TOKENS
         )
-        self.model_with_tools = llm.bind_tools(self.tools)
-        self.graph_app = self._build_graph()
+        
+        # Define tools
+        self.tools = [search_menu, get_restaurant_info, check_availability, create_reservation]
+        self.llm_with_tools = self.llm.bind_tools(self.tools)
+        
+        # Build graph
+        self.memory = MemorySaver()
+        self.graph = self._build_graph()
+        
+        logger.info("✅ ConversationOrchestrator initialized")
 
     def _build_graph(self):
-        """Builds the LangGraph state machine."""
-        workflow = StateGraph(SessionState)
-
-        def tools_condition(state: SessionState) -> str:
-            """A function to decide whether to call tools or end the conversation."""
-            last_message = state['messages'][-1]
-            if last_message.tool_calls:
-                return "tools"
-            return END
-
-        async def call_model(state: SessionState):
-            """The primary node that calls the LLM. This is the 'brain' of the agent."""
-            messages = state['messages']
-            # The system prompt is now part of the history, which is more robust
-            augmented_messages: list[BaseMessage] = [HumanMessage(content=SYSTEM_PROMPT)] + messages
-            response = await self.model_with_tools.ainvoke(augmented_messages)
-            return {"messages": [response]}
-
-        tool_node = ToolNode(self.tools)
-
-        workflow.add_node("agent", call_model)
-        workflow.add_node("tools", tool_node)
-        workflow.set_entry_point("agent")
-        workflow.add_conditional_edges("agent", tools_condition)
-        workflow.add_edge("tools", "agent")
-
-        # The checkpointer allows the graph to be stateful
-        return workflow.compile(checkpointer=MemorySaver())
+        """Build LangGraph state machine"""
+        builder = StateGraph(dict)
+        
+        def agent_node(state: dict):
+            """Agent node that calls LLM"""
+            messages = state.get("messages", [])
+            
+            # Add system prompt if not present
+            if not messages or not isinstance(messages[0], SystemMessage):
+                messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
+            
+            # Call LLM
+            response = self.llm_with_tools.invoke(messages)
+            
+            # Add response to messages
+            return {"messages": messages + [response]}
+        
+        # Add nodes
+        builder.add_node("agent", agent_node)
+        builder.add_node("tools", ToolNode(self.tools))
+        
+        # Add edges
+        builder.add_edge(START, "agent")
+        builder.add_conditional_edges("agent", tools_condition)
+        builder.add_edge("tools", "agent")
+        
+        return builder.compile(checkpointer=self.memory)
 
     async def stream_response(self, session_id: str, user_message: str) -> AsyncIterator[str]:
-        """Processes a user message using the graph and streams the text response."""
-        config = {"configurable": {"thread_id": session_id}}
-        inputs = {"messages": [HumanMessage(content=user_message)]}
-
-        # Stream events from the graph. We'll yield the content of AIMessage chunks.
-        async for event in self.graph_app.astream(inputs, config=config, stream_mode="updates"):
-            for value in event.values():
-                new_messages = value.get('messages', [])
-                if new_messages:
-                    last_message = new_messages[-1]
-                    if isinstance(last_message, AIMessage) and not last_message.tool_calls:
-                        yield last_message.content
+        """Stream response from the agent"""
+        try:
+            # Get or create session state
+            state = get_session_state(call_id=session_id, session_id=session_id)
+            
+            # Add user message to state
+            state.messages.append(Message(
+                role=MessageRole.USER,
+                content=user_message
+            ))
+            
+            # Convert to LangChain messages
+            lc_messages = [
+                HumanMessage(content=m.content) if m.role == MessageRole.USER 
+                else AIMessage(content=m.content)
+                for m in state.messages
+            ]
+            
+            config = {"configurable": {"thread_id": session_id}}
+            
+            # Stream from graph
+            buffer = ""
+            async for event in self.graph.astream({"messages": lc_messages}, config, stream_mode="values"):
+                messages = event.get("messages", [])
+                if messages:
+                    latest = messages[-1]
+                    
+                    # Extract content from AIMessage
+                    if hasattr(latest, "content") and isinstance(latest.content, str):
+                        content = latest.content
+                        
+                        # Add to buffer
+                        buffer += content
+                        
+                        # Split into sentences
+                        sentences = re.split(r'([.!?]+\s+)', buffer)
+                        
+                        # Yield complete sentences
+                        for i in range(0, len(sentences) - 1, 2):
+                            if i + 1 < len(sentences):
+                                sentence = sentences[i] + sentences[i + 1]
+                                if sentence.strip():
+                                    yield sentence.strip()
+                        
+                        # Keep incomplete sentence in buffer
+                        buffer = sentences[-1] if len(sentences) % 2 == 1 else ""
+            
+            # Yield remaining buffer
+            if buffer.strip():
+                yield buffer.strip()
+            
+            # Update session state
+            if lc_messages:
+                latest_ai = lc_messages[-1]
+                if hasattr(latest_ai, "content"):
+                    state.messages.append(Message(
+                        role=MessageRole.ASSISTANT,
+                        content=latest_ai.content
+                    ))
+            
+            update_session_state(session_id, state)
+            
+        except Exception as e:
+            logger.error(f"stream_response error: {e}", exc_info=True)
+            yield "I apologize, I'm having trouble processing that. Could you repeat your request?"
 
 _orchestrator_instance = None
 
-def get_orchestrator() -> "ConversationOrchestrator":
+def get_orchestrator() -> ConversationOrchestrator:
     """Returns a singleton instance of the ConversationOrchestrator."""
     global _orchestrator_instance
     if _orchestrator_instance is None:

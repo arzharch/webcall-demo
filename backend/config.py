@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     TTS_MODEL: str = "tts_models/en/ljspeech/tacotron2-DDC"
     
     # LLM Config (Gemini)
-    GEMINI_MODEL: str = "gemini-1.5-flash" # Updated model
+    GEMINI_MODEL: str = "gemini-2.5-flash" # Updated model
     MAX_TOKENS: int = 250
     TEMPERATURE: float = 0.7
     AGENT_VERBOSE: bool = False # Added for configurable verbosity

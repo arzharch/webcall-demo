@@ -1,119 +1,97 @@
 import asyncio
 import io
+import logging
 from functools import lru_cache
-from typing import Optional, AsyncIterator
-import re
-import numpy as np
+from typing import Optional
 
-from TTS.api import TTS
+import numpy as np
 import soundfile as sf
+from TTS.api import TTS
+
 from config import get_settings
 
+logger = logging.getLogger(__name__)
+
 class TTSService:
-    """
-    Text-to-Speech service using Coqui TTS with true streaming support.
-    """
+    """Text-to-Speech using Coqui TTS"""
     
     def __init__(self):
         self.settings = get_settings()
-        self.tts: Optional[TTS] = None
-        self._initialized = False
+        self.model = None
+        self.is_initialized = False
     
     async def initialize(self):
-        """Initializes and loads the Coqui TTS model."""
-        if self._initialized:
+        """Initialize TTS model"""
+        if self.is_initialized:
             return
-        
-        print(f"🔄 Initializing TTS Service (Coqui model: {self.settings.TTS_MODEL})...")
-        loop = asyncio.get_running_loop()
-        def _load_model():
-            return TTS(model_name=self.settings.TTS_MODEL, progress_bar=False)
-        self.tts = await loop.run_in_executor(None, _load_model)
-        self._initialized = True
-        print("✅ TTS Service initialized.")
-
-    async def synthesize_streaming(self, text_stream: AsyncIterator[str]) -> AsyncIterator[bytes]:
-        """
-        Synthesizes text into speech audio, streaming the output. This version
-        buffers text chunks into sentences before synthesizing, which produces
-        more natural-sounding speech.
-        """
-        if not self._initialized:
-            await self.initialize()
-
-        loop = asyncio.get_running_loop()
-        sentence_buffer = ""
-        sentence_delimiters = re.compile(r'(?<=[.?!])\s*')
-
-        async for text_chunk in text_stream:
-            sentence_buffer += text_chunk
             
-            # Split the buffer into sentences
-            sentences = sentence_delimiters.split(sentence_buffer)
+        try:
+            print(f"🔄 Initializing TTS Service (Coqui model: {self.settings.TTS_MODEL})...")
+            loop = asyncio.get_event_loop()
             
-            # The last part of the split might be an incomplete sentence,
-            # so we keep it in the buffer.
-            sentence_buffer = sentences.pop(-1)
+            def _load_model():
+                return TTS(
+                    model_name=self.settings.TTS_MODEL,
+                    progress_bar=False,
+                    gpu=False
+                )
             
-            for sentence in sentences:
-                if not sentence: continue
-
-                print(f"🔊 TTS Synthesizing sentence: '{sentence}'")
-                try:
-                    def _synthesize_stream():
-                        return self.tts.tts_stream(
-                            text=sentence,
-                            speaker=self.tts.speakers[0],
-                            language=self.tts.languages[0],
-                            speed=1.0 
-                        )
-                    
-                    audio_chunks_generator = await loop.run_in_executor(None, _synthesize_stream)
-                    for chunk in audio_chunks_generator:
-                        audio_array = np.frombuffer(np.array(chunk), dtype=np.float32)
-                        with io.BytesIO() as wav_io:
-                            sf.write(wav_io, audio_array, self.settings.SAMPLE_RATE, format='WAV')
-                            yield wav_io.getvalue()
-                except Exception as e:
-                    print(f"❌ TTS Error during streaming for sentence '{sentence}': {e}")
-                    continue
-        
-        # Synthesize any remaining text in the buffer after the stream ends
-        if sentence_buffer.strip():
-            print(f"🔊 TTS Synthesizing final buffer: '{sentence_buffer}'")
-            try:
-                def _synthesize_stream():
-                    return self.tts.tts_stream(
-                        text=sentence_buffer,
-                        speaker=self.tts.speakers[0],
-                        language=self.tts.languages[0],
-                        speed=1.0
-                    )
-                audio_chunks_generator = await loop.run_in_executor(None, _synthesize_stream)
-                for chunk in audio_chunks_generator:
-                    audio_array = np.frombuffer(np.array(chunk), dtype=np.float32)
-                    with io.BytesIO() as wav_io:
-                        sf.write(wav_io, audio_array, self.settings.SAMPLE_RATE, format='WAV')
-                        yield wav_io.getvalue()
-            except Exception as e:
-                print(f"❌ TTS Error on final buffer: {e}")
-
-
+            self.model = await loop.run_in_executor(None, _load_model)
+            self.is_initialized = True
+            print("✅ TTS Service initialized.")
+            logger.info(f"TTS initialized: {self.settings.TTS_MODEL}")
+        except Exception as e:
+            logger.error(f"TTS initialization error: {e}")
+            raise
+    
     async def synthesize(self, text: str) -> bytes:
-        """
-        Synthesizes a single block of text to audio. This is a non-streaming
-        convenience wrapper around the streaming method.
-        """
-        async def text_generator():
-            yield text
+        """Synthesize text to audio bytes"""
+        if not self.is_initialized:
+            await self.initialize()
         
-        audio_chunks = []
-        async for chunk in self.synthesize_streaming(text_generator()):
-            audio_chunks.append(chunk)
+        try:
+            print(f"🔊 TTS Synthesizing: '{text[:50]}...'")
             
-        return b"".join(audio_chunks)
+            # Generate speech in executor to avoid blocking
+            wav_array = await self._generate_speech(text)
+            
+            # Convert to bytes
+            audio_bytes = self._array_to_bytes(wav_array)
+            
+            logger.info(f"✅ Synthesized: {len(audio_bytes)} bytes")
+            return audio_bytes
+        
+        except Exception as e:
+            logger.error(f"❌ Synthesis error: {e}")
+            print(f"❌ TTS Error: {e}")
+            return b""
+    
+    async def _generate_speech(self, text: str) -> np.ndarray:
+        """Generate speech array in executor"""
+        loop = asyncio.get_event_loop()
+        
+        def _tts():
+            wav = self.model.tts(text)
+            return np.array(wav) if isinstance(wav, list) else wav
+        
+        wav = await loop.run_in_executor(None, _tts)
+        return wav
+    
+    def _array_to_bytes(self, audio_array: np.ndarray) -> bytes:
+        """Convert audio array to WAV bytes"""
+        buffer = io.BytesIO()
+        
+        sf.write(
+            buffer,
+            audio_array,
+            self.settings.SAMPLE_RATE,
+            format='WAV'
+        )
+        
+        buffer.seek(0)
+        return buffer.read()
 
 @lru_cache()
 def get_tts_service() -> TTSService:
-    """Get a cached singleton instance of the TTSService."""
+    """Get cached TTS service"""
     return TTSService()
