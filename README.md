@@ -14,7 +14,7 @@ For a detailed breakdown of the architecture, components, and key concepts, plea
 ## Project Setup
 
 ### 1. Prerequisites
-- Python 3.10+
+- Python 3.11+
 - An environment management tool like `venv` or `conda`.
 - Node.js and `npm` (for the frontend, if you choose to build it).
 
