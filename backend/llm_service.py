@@ -6,9 +6,9 @@ import re
 import asyncio
 from functools import lru_cache
 
-from config_clean import get_settings
-from models_clean import Message, MessageRole, BookingIntent
-from prompts_clean import get_system_prompt
+from backend.config import get_settings
+from backend.models import Message, MessageRole, BookingIntent
+from backend.prompts import get_system_prompt
 
 logger = logging.getLogger(__name__)
 
