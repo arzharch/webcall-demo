@@ -60,4 +60,3 @@ class SpeechGate:
             self.triggered = False
             return voiced_audio
         return None
-*** End of File

@@ -54,4 +54,3 @@ class CostTracker:
         self.completion_tokens = 0
         self.stt_seconds = 0.0
         self.tts_characters = 0
-*** End of File

@@ -59,4 +59,3 @@ class DeepgramSTTService:
             wav_file.writeframes(pcm_bytes)
         buffer.seek(0)
         return buffer.read()
-*** End of File

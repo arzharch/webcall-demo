@@ -279,4 +279,3 @@ def get_voice_manager() -> VoiceCallManager:
 def _chunk_bytes(data: bytes, frame_bytes: int):
     for idx in range(0, len(data), frame_bytes):
         yield data[idx : idx + frame_bytes]
-*** End of File

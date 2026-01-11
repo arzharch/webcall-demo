@@ -63,4 +63,3 @@ def get_restaurant_template() -> RestaurantTemplate:
     if _template is None:
         _template = RestaurantTemplate()
     return _template
-*** End of File

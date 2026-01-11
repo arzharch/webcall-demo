@@ -310,4 +310,3 @@ def get_database() -> Database:
         settings = get_settings()
         _database = Database(settings.SQLITE_DB_PATH)
     return _database
-*** End of File

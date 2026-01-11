@@ -43,4 +43,3 @@ class GoogleTTSService:
             audio_config=audio_config,
         )
         return response.audio_content
-*** End of File
