@@ -10,6 +10,7 @@ class BookingDetails(BaseModel):
 class SessionState(BaseModel):
     """Tracks the full state of a conversation session."""
     session_id: str
+    caller_name: Optional[str] = None
     current_intent: str = "GENERAL_CONVERSATION"
     booking_details: BookingDetails = Field(default_factory=BookingDetails)
     conversation_history: List[str] = Field(default_factory=list)

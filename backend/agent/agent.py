@@ -1,79 +1,201 @@
-import os
-from typing import AsyncGenerator
+import sqlite3
+from contextvars import ContextVar
+from datetime import datetime
+from typing import AsyncGenerator, Optional
 
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnableBranch, RunnablePassthrough
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import AgentExecutor, tool
 from langchain.pydantic_v1 import BaseModel, Field
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from agent.state import SessionState
+from backend.config import get_settings
+from backend.services.restaurant import get_restaurant_template
 
 
-# --- LangChain Tools ---
+settings = get_settings()
+restaurant_template = get_restaurant_template()
+SESSION_CONTEXT: ContextVar[dict] = ContextVar("SESSION_CONTEXT", default={})
 
-@tool
-def search_menu(query: str) -> str:
-    """
-    Searches the restaurant's menu items and answers questions about them.
-    Use this for any questions related to food, drinks, ingredients, or prices.
-    Example: 'What's in the Carbonara?' or 'Do you have vegan options?'
-    """
-    # In a real implementation, this would query a vector database (FAISS).
-    # For this MVP, we'll use a placeholder response.
-    return "The Carbonara is a classic Roman dish with spaghetti, eggs, Pecorino Romano cheese, and guanciale. We also have a delicious vegetarian lasagna."
-
-@tool
-def check_availability(date: str, time: str, party_size: int) -> str:
-    """
-    Checks for table availability and makes a booking.
-    Use this when the user wants to reserve a table.
-    Captures date, time, and party_size. If any are missing, the LLM will ask for them.
-    """
-    # In a real implementation, this would check a booking system and create a ticket.
-    return f"I've booked a table for {party_size} people on {date} at {time}. We look forward to seeing you!"
-
-# --- Pydantic Models for Tool Input ---
 
 class MenuSearchInput(BaseModel):
-    query: str = Field(description="The user's question about the menu.")
+    query: str = Field(description="The guest's question about the menu.")
+
 
 class AvailabilityCheckInput(BaseModel):
-    date: str = Field(description="The desired date for the booking, e.g., 'tomorrow' or '2024-08-15'.")
-    time: str = Field(description="The desired time for the booking, e.g., '7 PM'.")
-    party_size: int = Field(description="The number of people in the party.")
+    date: str = Field(description="Desired date in YYYY-MM-DD format.")
+    time: str = Field(description="Desired time, e.g. '19:30' or '7 PM'.")
+    party_size: int = Field(description="Party size between 1 and 12.")
+    special_requests: Optional[str] = Field(
+        default=None, description="Optional notes such as allergies or celebrations."
+    )
+    caller_name: Optional[str] = Field(
+        default=None, description="Caller name if already captured in the call setup."
+    )
+    session_id: Optional[str] = Field(
+        default=None, description="Internal session identifier for logging."
+    )
 
 
-# --- The Orchestrator ---
+def _menu_lookup(query: str) -> str:
+    query_lower = query.lower()
+    matches = []
+    for item in restaurant_template.menu:
+        haystack = f"{item['name']} {item['description']} {' '.join(item.get('dietary', []))}".lower()
+        if query_lower in haystack:
+            matches.append(item)
+    if not matches:
+        return "I did not find an exact match, but we offer handcrafted pasta, wood-fired pizzas, and seasonal chef's specials."
+
+    top = matches[:3]
+    lines = [
+        f"{entry['name']} ({entry['price']}): {entry['description']}"
+        for entry in top
+    ]
+    return "\n".join(lines)
+
+
+def _normalize_time(raw_time: str) -> Optional[str]:
+    raw = raw_time.strip().upper()
+    patterns = ["%H:%M", "%I:%M %p", "%I %p"]
+    for pattern in patterns:
+        try:
+            parsed = datetime.strptime(raw, pattern)
+            return parsed.strftime("%H:%M")
+        except ValueError:
+            continue
+    return None
+
+
+@tool(args_schema=MenuSearchInput)
+def search_menu(query: str) -> str:
+    """Answer detailed menu questions using the restaurant knowledge base."""
+    return _menu_lookup(query)
+
+
+@tool(args_schema=AvailabilityCheckInput)
+def check_availability(
+    date: str,
+    time: str,
+    party_size: int,
+    special_requests: Optional[str] = None,
+    caller_name: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """Look up a table slot and tentatively book it in SQLite."""
+
+    ctx = SESSION_CONTEXT.get({})
+    active_session = session_id or ctx.get("session_id")
+    effective_name = caller_name or ctx.get("caller_name") or "Guest"
+
+    if not active_session:
+        return "I could not verify the session. Please restart the call."
+
+    try:
+        target_date = datetime.fromisoformat(date)
+    except ValueError:
+        return "Could you share the date in YYYY-MM-DD format?"
+
+    slot = _normalize_time(time)
+    if slot is None:
+        return "I can book every 30 minutes. Please use a format like 19:30."
+
+    if not (1 <= party_size <= settings.MAX_PARTY_SIZE):
+        return f"We can host parties up to {settings.MAX_PARTY_SIZE} guests."
+
+    slots_for_day = restaurant_template.generate_slots_for_date(target_date)
+    if slot not in slots_for_day:
+        return (
+            f"We seat between {settings.RESERVATION_SERVICE_START} and {settings.RESERVATION_SERVICE_END}."
+        )
+
+    event = restaurant_template.get_event_for_day(target_date.strftime("%A"))
+
+    with sqlite3.connect(settings.SQLITE_DB_PATH) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        capacity = conn.execute(
+            """
+            SELECT COUNT(*) FROM reservations
+            WHERE reservation_date = ? AND reservation_time = ? AND status != 'cancelled'
+            """,
+            (date, slot),
+        ).fetchone()[0]
+
+        if capacity >= settings.TABLES_PER_SLOT:
+            return f"We are fully booked at {slot} on {date}. Could we try another time?"
+
+        conn.execute(
+            """
+            INSERT INTO reservations (
+                session_id, caller_name, reservation_date, reservation_time,
+                party_size, status, special_requests, event_tag,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, datetime('now'), datetime('now'))
+            """,
+            (
+                active_session,
+                effective_name,
+                date,
+                slot,
+                party_size,
+                special_requests,
+                event["title"] if event else None,
+            ),
+        )
+
+        conn.commit()
+
+    confirmation = (
+        f"I penciled you in for {party_size} guests on {date} at {slot}. "
+        "I'll send a confirmation shortly."
+    )
+    if event:
+        confirmation += f" That evening features our {event['title'].lower()}!"
+    if special_requests:
+        confirmation += f" Noted your request: {special_requests}."
+    return confirmation
+
 
 class BellaAgent:
     """The 'brain' of the voice bot, powered by LangChain."""
 
     def __init__(self, google_api_key: str):
-        self.llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=google_api_key, temperature=0)
+        self.llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            google_api_key=google_api_key,
+            temperature=0.3,
+        )
         self.tools = [search_menu, check_availability]
         self.agent_executor = self._create_agent_executor()
 
     def _create_agent_executor(self):
         """Creates the LangChain agent and executor."""
+        system_prompt = (
+            "You are Maria, Bella Cucina's concierge. Keep replies under 3 sentences, "
+            "sound natural for a phone call, and collect booking details methodically. "
+            f"The dining room has {settings.TOTAL_TABLES} tables with up to {settings.TABLES_PER_SLOT} "
+            "bookable per 30-minute slot. Business hours run from "
+            f"{settings.RESERVATION_SERVICE_START} to {settings.RESERVATION_SERVICE_END}. "
+            "Use check_availability once you know date, time, and party size, and include the caller's name."
+        )
+
         prompt = ChatPromptTemplate.from_messages(
             [
-                ("system", "You are a helpful and friendly restaurant receptionist named Bella. Your goal is to assist users with their questions and bookings. Be conversational and natural."),
+                ("system", system_prompt),
                 MessagesPlaceholder(variable_name="chat_history"),
                 ("user", "{input}"),
                 MessagesPlaceholder(variable_name="agent_scratchpad"),
             ]
         )
-        agent = AgentExecutor(agent=self.llm | prompt, tools=self.tools, verbose=True)
-        return agent
+        return AgentExecutor(agent=self.llm | prompt, tools=self.tools, verbose=True)
 
-    async def process_message(self, state: SessionState, user_message: str) -> AsyncGenerator[str, None]:
-        """
-        Processes a user message, invokes the appropriate tools, and streams the response.
-        """
-        # This is a simplified placeholder. A real implementation would use LCEL
-        # with RunnableBranch for intent detection and routing.
-        # For now, we'll pass the message directly to the agent.
+    async def process_message(
+        self, state: SessionState, user_message: str
+    ) -> AsyncGenerator[str, None]:
+        """Processes a user message, invokes tools, and streams the reply."""
+        context_token = SESSION_CONTEXT.set(
+            {"session_id": state.session_id, "caller_name": state.caller_name}
+        )
 
         response_stream = self.agent_executor.astream(
             {
@@ -82,8 +204,9 @@ class BellaAgent:
             }
         )
 
-        async for chunk in response_stream:
-            # This simplified streaming only yields the final output.
-            # A more advanced version would stream tokens as they are generated.
-            if "output" in chunk:
-                yield chunk["output"]
+        try:
+            async for chunk in response_stream:
+                if "output" in chunk:
+                    yield chunk["output"]
+        finally:
+            SESSION_CONTEXT.reset(context_token)

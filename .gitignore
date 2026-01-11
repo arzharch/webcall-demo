@@ -5,3 +5,4 @@ frontend/node_modules
 __pycache__/
 *.pyc
 synthion-demo-call-80b547a5bbbd.json
+demo/

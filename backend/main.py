@@ -1,11 +1,10 @@
-import os
-import uuid
-from fastapi import FastAPI, WebSocket, Depends
-from starlette.websockets import WebSocketDisconnect
 from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, WebSocket
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from starlette.websockets import WebSocketDisconnect
 
-from agent.agent import BellaAgent
-from agent.state import SessionState
+from backend.services.voice_session import get_voice_manager, VoiceCallManager
 
 # Load environment variables
 load_dotenv()
@@ -17,69 +16,75 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# --- In-Memory State Management ---
-# (In a production scenario, use Redis or a database)
-active_sessions = {}
+def get_manager() -> VoiceCallManager:
+    return get_voice_manager()
 
-# --- Dependencies ---
 
-def get_agent() -> BellaAgent:
-    """Dependency to get a singleton instance of the BellaAgent."""
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError("GOOGLE_API_KEY environment variable not set.")
-    # This could be enhanced to use a singleton pattern
-    return BellaAgent(google_api_key=api_key)
+@app.on_event("startup")
+async def bootstrap_voice_stack() -> None:
+    await get_voice_manager().startup()
+
+
+class SessionStartRequest(BaseModel):
+    caller_name: str = Field(min_length=2, description="Name captured before joining the call")
+
+
+class OfferRequest(BaseModel):
+    session_id: str
+    signaling_token: str
+    sdp: str
+    type: str = "offer"
 
 # --- REST Endpoint for Session Initiation ---
 
 @app.post("/session/start")
-async def start_session():
-    """Starts a new conversation session and returns a unique session ID."""
-    session_id = str(uuid.uuid4())
-    initial_state = SessionState(session_id=session_id)
-    active_sessions[session_id] = initial_state
-    return {"session_id": session_id}
+async def start_session(payload: SessionStartRequest, manager: VoiceCallManager = Depends(get_manager)):
+    """Starts a new session linked to a caller name and returns signaling secrets."""
+    session_meta = await manager.create_session(payload.caller_name)
+    return session_meta
+
+
+@app.post("/webrtc/offer")
+async def negotiate_offer(payload: OfferRequest, manager: VoiceCallManager = Depends(get_manager)):
+    """Handles WebRTC offer/answer exchange for browser callers."""
+    try:
+        answer = await manager.handle_offer(
+            session_id=payload.session_id,
+            signaling_token=payload.signaling_token,
+            offer={"sdp": payload.sdp, "type": payload.type},
+        )
+        return answer
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/session/{session_id}")
+async def end_session(session_id: str, manager: VoiceCallManager = Depends(get_manager)):
+    await manager.end_session(session_id, status="ended_by_user")
+    return JSONResponse({"session_id": session_id, "status": "closed"})
 
 # --- WebSocket Endpoint for Conversation ---
 
-@app.websocket("/ws/audio/{session_id}")
-async def websocket_endpoint(
-    websocket: WebSocket,
-    session_id: str,
-    agent: BellaAgent = Depends(get_agent),
-):
-    """Handles the main audio conversation loop."""
+@app.websocket("/ws/text/{session_id}")
+async def websocket_text_bridge(websocket: WebSocket, session_id: str):
+    """Fallback text channel for debugging without WebRTC audio."""
     await websocket.accept()
-    
-    if session_id not in active_sessions:
-        await websocket.close(code=1008, reason="Invalid session_id")
-        return
+    manager = get_voice_manager()
 
-    state = active_sessions[session_id]
-    
     try:
         while True:
-            # For this phase, we'll receive text instead of audio bytes
-            user_message = await websocket.receive_text()
-
-            # Process message with the agent and stream response
-            async for response_chunk in agent.process_message(state, user_message):
-                await websocket.send_text(response_chunk)
-            
-            # Update history after the full response is sent
-            # Note: A more sophisticated approach would be needed to get the full AI response
-            # when streaming token-by-token. For now, we assume the last chunk is the full message.
-            state.update_history(user_message, "AI response will be logged here.") # Placeholder
-
+            payload = await websocket.receive_text()
+            try:
+                ai_reply = await manager.ingest_text(session_id, payload)
+            except ValueError as exc:
+                await websocket.send_text(f"Session error: {exc}")
+                await websocket.close(code=1008)
+                return
+            await websocket.send_text(ai_reply or "...")
     except WebSocketDisconnect:
-        print(f"Client disconnected from session {session_id}")
-        # Clean up the session
-        if session_id in active_sessions:
-            del active_sessions[session_id]
-    except Exception as e:
-        print(f"An error occurred in session {session_id}: {e}")
-        # Clean up the session
-        if session_id in active_sessions:
-            del active_sessions[session_id]
-        await websocket.close(code=1011, reason="Internal Server Error")
+        await manager.end_session(session_id, status="disconnected")
+    except Exception as exc:
+        await manager.end_session(session_id, status="error")
+        await websocket.close(code=1011, reason=str(exc))
