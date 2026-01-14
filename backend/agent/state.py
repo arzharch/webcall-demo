@@ -12,6 +12,7 @@ Intent = Literal[
     "check_availability",
     "search_menu",
     "general_query",
+    "off_topic",
     "unknown",
 ]
 
@@ -55,3 +56,4 @@ class SessionState(BaseModel):
     current_intent: Optional[Intent] = "unknown"
     booking_slot: BookingSlot = Field(default_factory=BookingSlot)
     awaiting_confirmation: bool = False  # True when we've asked user to confirm booking
+    confusion_count: int = 0  # Track consecutive gibberish/confusion messages

@@ -69,7 +69,9 @@ class BookingManager:
             '- Any other day name -> find next occurrence\n\n'
             "TIME PARSING:\n"
             '- "6:30 pm" -> "18:30"\n'
-            '- "7" -> "19:00" (if dinner context implication)\n\n'
+            '- "2 pm" -> "14:00"\n'
+            '- "7" -> "19:00" (if dinner context implication)\n'
+            '- If the restaurant is only open 5pm-11pm, and user says "2pm", set time="14:00" anyway. The check_availability tool will handle the rejection.\n\n'
             "{format_instructions}"
         )
     
@@ -105,7 +107,26 @@ class BookingManager:
             if result.date:
                 current_slot.date = result.date
             if result.time:
-                current_slot.time = result.time
+                # Validate common format issues from LLM
+                try:
+                    # sometimes LLM extracts '14:00' correctly, sometimes converts to '2:00 PM'
+                    # enforce 24h format if it slipped through
+                    t = result.time.lower().strip()
+                    if "pm" in t or "am" in t:
+                        if ":" in t:
+                            t_dt = datetime.strptime(t, "%I:%M %p")
+                        else:
+                            # Handle "2 pm" without minutes
+                            t_dt = datetime.strptime(t, "%I %p")
+                        current_slot.time = t_dt.strftime("%H:%M")
+                    elif ":" not in t and t.isdigit():
+                         # Handle "14" -> "14:00"
+                         current_slot.time = f"{int(t):02d}:00"
+                    else:
+                        current_slot.time = result.time
+                except Exception as e:
+                    logger.warning(f"Time parsing fallback failed for '{result.time}': {e}")
+                    current_slot.time = result.time
             if result.name:
                 current_slot.name = result.name
             if result.notes:
@@ -127,10 +148,8 @@ class BookingManager:
         Manage the booking conversation flow with slot filling.
         Returns a natural response to the user.
         """
-        # Extract information from user's message
-        state.booking_slot = await self.extract_info(user_message, state.booking_slot, state.conversation_history)
-        
-        # Check if user is confirming a booking
+        # 1. Check if user is answering a confirmation request
+        # We do this BEFORE extraction to avoid confusing "yes" with data
         if state.awaiting_confirmation:
             if self._is_confirmation(user_message):
                 # User confirmed, actually make the booking
@@ -144,16 +163,15 @@ class BookingManager:
                 state.awaiting_confirmation = False
                 state.booking_slot = BookingSlot()  # Reset
                 return result
-            elif self._is_rejection(user_message):
-                # User wants to change something
-                state.awaiting_confirmation = False
-                return "No problem! What would you like to change?"
             else:
-                # User might be providing additional info, try to extract again
-                state.booking_slot = await self.extract_info(user_message, state.booking_slot)
-                # Continue with normal flow below
+                # User rejected or is providing new info (e.g., "No, actually 5 people")
+                # Clear the flag and proceed to extraction
+                state.awaiting_confirmation = False
+
+        # 2. Extract information from user's message
+        state.booking_slot = await self.extract_info(user_message, state.booking_slot, state.conversation_history)
         
-        # Check if we have all required information
+        # 3. Check if we have all required information
         if state.booking_slot.is_complete_for_new_booking():
             # We have everything, check availability and confirm
             try:
