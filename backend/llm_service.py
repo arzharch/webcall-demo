@@ -6,9 +6,9 @@ import re
 import asyncio
 from functools import lru_cache
 
-from backend.config import get_settings
-from backend.models import Message, MessageRole, BookingIntent
-from backend.prompts import get_system_prompt
+from config import get_settings
+from models import Message, MessageRole, BookingIntent
+from prompts import get_system_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ class LLMService:
     def __init__(self):
         self.settings = get_settings()
         
-        genai.configure(api_key=self.settings.GEMINI_API_KEY)
+        genai.configure(api_key=self.settings.GOOGLE_API_KEY)
         
         self.model = genai.GenerativeModel(
             model_name=self.settings.GEMINI_MODEL,

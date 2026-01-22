@@ -6,8 +6,8 @@ from typing import Optional, List
 import logging
 from functools import lru_cache
 
-from backend.config import get_settings
-from backend.models import CallTranscript, Ticket
+from config import get_settings
+from models import CallTranscript, Ticket
 
 logger = logging.getLogger(__name__)
 

@@ -1,10 +1,22 @@
-from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, WebSocket
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from starlette.websockets import WebSocketDisconnect
+from __future__ import annotations
 
-from backend.services.voice_session import get_voice_manager, VoiceCallManager
+import logging
+
+from dotenv import load_dotenv
+
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(name)s - %(levelname)s - %(message)s",
+)
+# ---
+
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from config import get_settings
+from services.voice_session import VoiceCallManager, get_voice_manager
 
 # Load environment variables
 load_dotenv()
@@ -16,75 +28,76 @@ app = FastAPI(
     version="1.0.0",
 )
 
-def get_manager() -> VoiceCallManager:
-    return get_voice_manager()
+settings = get_settings()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-@app.on_event("startup")
-async def bootstrap_voice_stack() -> None:
-    await get_voice_manager().startup()
+class StartSessionPayload(BaseModel):
+    caller_name: str = Field(..., min_length=2)
 
 
-class SessionStartRequest(BaseModel):
-    caller_name: str = Field(min_length=2, description="Name captured before joining the call")
+class SessionMeta(BaseModel):
+    session_id: str
+    signaling_token: str
 
 
-class OfferRequest(BaseModel):
+class OfferPayload(BaseModel):
     session_id: str
     signaling_token: str
     sdp: str
-    type: str = "offer"
+    type: str
 
-# --- REST Endpoint for Session Initiation ---
 
-@app.post("/session/start")
-async def start_session(payload: SessionStartRequest, manager: VoiceCallManager = Depends(get_manager)):
-    """Starts a new session linked to a caller name and returns signaling secrets."""
-    session_meta = await manager.create_session(payload.caller_name)
-    return session_meta
+@app.post("/session/start", response_model=SessionMeta)
+async def start_session(
+    payload: StartSessionPayload,
+    manager: VoiceCallManager = Depends(get_voice_manager),
+):
+    name = payload.caller_name.strip().lower()
+    meta = await manager.create_session(name)
+    return SessionMeta(**meta)
 
 
 @app.post("/webrtc/offer")
-async def negotiate_offer(payload: OfferRequest, manager: VoiceCallManager = Depends(get_manager)):
-    """Handles WebRTC offer/answer exchange for browser callers."""
+async def handle_offer(
+    payload: OfferPayload,
+    manager: VoiceCallManager = Depends(get_voice_manager),
+):
     try:
-        answer = await manager.handle_offer(
-            session_id=payload.session_id,
-            signaling_token=payload.signaling_token,
-            offer={"sdp": payload.sdp, "type": payload.type},
+        answer = await manager.accept_offer(
+            payload.session_id,
+            payload.signaling_token,
+            {"sdp": payload.sdp, "type": payload.type},
         )
         return answer
-    except PermissionError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-
-@app.delete("/session/{session_id}")
-async def end_session(session_id: str, manager: VoiceCallManager = Depends(get_manager)):
-    await manager.end_session(session_id, status="ended_by_user")
-    return JSONResponse({"session_id": session_id, "status": "closed"})
-
-# --- WebSocket Endpoint for Conversation ---
 
 @app.websocket("/ws/text/{session_id}")
-async def websocket_text_bridge(websocket: WebSocket, session_id: str):
-    """Fallback text channel for debugging without WebRTC audio."""
+async def transcript_ws(
+    websocket: WebSocket,
+    session_id: str,
+    manager: VoiceCallManager = Depends(get_voice_manager),
+):
     await websocket.accept()
-    manager = get_voice_manager()
+    try:
+        queue = manager.subscribe_transcripts(session_id)
+    except ValueError:
+        await websocket.close(code=4404)
+        return
 
     try:
         while True:
-            payload = await websocket.receive_text()
-            try:
-                ai_reply = await manager.ingest_text(session_id, payload)
-            except ValueError as exc:
-                await websocket.send_text(f"Session error: {exc}")
-                await websocket.close(code=1008)
-                return
-            await websocket.send_text(ai_reply or "...")
+            message = await queue.get()
+            await websocket.send_json(message)
     except WebSocketDisconnect:
-        await manager.end_session(session_id, status="disconnected")
-    except Exception as exc:
-        await manager.end_session(session_id, status="error")
-        await websocket.close(code=1011, reason=str(exc))
+        pass
+    finally:
+        manager.unsubscribe_transcripts(session_id, queue)

@@ -1,6 +1,11 @@
 """Main agent orchestrator."""
 
 try:
+    from langchain_openai import ChatOpenAI
+except ImportError:
+    from langchain_community.chat_models import ChatOpenAI
+
+try:
     from langchain_ollama import ChatOllama
 except ImportError:  # Fallback until langchain-ollama is installed everywhere
     from langchain_community.chat_models import ChatOllama
@@ -18,8 +23,9 @@ class BellaAgent:
         self.state = state
         # The orchestrator will now manage the LLM and tools
         # We need to pass an LLM instance to the orchestrator.
-        # Use a local Mistral model served via Ollama for testing.
-        llm = ChatOllama(model="mistral", temperature=0)
+        # Use OpenAI GPT-3.5 Turbo for better instruction following and low latency.
+        # Fallback to Ollama if OpenAI API key is missing happens in execution, but here we set up the object.
+        llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
         self.orchestrator = ConversationOrchestrator(llm=llm)
 
     async def respond(self, user_text: str) -> str:

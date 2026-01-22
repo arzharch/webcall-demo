@@ -35,7 +35,7 @@ class BookingSlot(BaseModel):
         """Get list of missing required fields."""
         missing = []
         if not self.party_size:
-            missing.append("party size")
+            missing.append("party_size")
         if not self.date:
             missing.append("date")
         if not self.time:

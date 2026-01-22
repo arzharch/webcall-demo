@@ -105,9 +105,12 @@ class ConversationOrchestrator:
         Validates and sanitizes the intent output.
         If it's not a valid category, defaults to 'general_query'.
         """
+        # Clean the intent output more aggressively
+        intent_output = intent_output.strip().lower().replace("'", "").replace('"', "")
+        
         valid_intents = [
             "make_booking", "update_booking", "cancel_booking",
-            "find_booking", "check_availability", "search_menu", 
+            "find_booking", "check_availability", "search_menu",  
             "general_query", "off_topic"
         ]
         
@@ -145,10 +148,11 @@ class ConversationOrchestrator:
                     "4. 'find_booking' - User wants to CHECK or LOOK UP an existing reservation (e.g., 'Do I have a reservation?', 'Check my booking')\n"
                     "5. 'check_availability' - User wants to CHECK if a time/date is available (e.g., 'Are you open Friday?', 'Do you have tables tonight?')\n"
                     "6. 'search_menu' - User asks about food, menu items, or restaurant offerings (e.g., 'What do you serve?', 'Do you have vegan options?')\n"
-                    "7. 'general_query' - Greetings, small talk, questions about the restaurant (e.g., 'Hi', 'How are you?', 'Where are you located?')\n"
+                    "7. 'general_query' - Greetings, small talk, ending conversation, polite closing (e.g., 'Hi', 'How are you?', 'Thank you', 'Bye')\n"
                     "8. 'off_topic' - Inputs completely unrelated to the restaurant (e.g. math questions, general knowledge, 'how tall is eiffel tower', sad stories, code requests).\n\n"
                     "IMPORTANT RULES:\n"
                     "- Greetings like 'hi', 'hello', 'hey' are ALWAYS 'general_query'\n"
+                    "- Closing remarks like 'thank you', 'thanks', 'bye', 'goodbye', 'ok thanks' are ALWAYS 'general_query'\n"
                     "- Small talk like 'how are you?' is ALWAYS 'general_query'\n"
                     "- Random text or gibberish -> 'off_topic'\n"
                     "- Emotional pleas or emergencies -> 'off_topic'\n"
@@ -202,6 +206,10 @@ class ConversationOrchestrator:
         )
         return prompt | llm
 
+    async def _handle_availability_check(self, state: SessionState, user_message: str):
+        """Wrapper to call booking manager since RunnableLambda doesn't await properly in branch"""
+        return await self.booking_manager.handle_booking_conversation(state, user_message)
+
     async def process_message(
         self, state: SessionState, user_message: str
     ) -> AsyncGenerator[str, None]:
@@ -209,6 +217,11 @@ class ConversationOrchestrator:
         Processes a user message, classifies intent, routes to the appropriate chain,
         and yields response chunks.
         """
+        # ... existing guardrails ...
+        
+        # Explicit handling for check_availability routing to avoid RunnableBranch async issues
+        # that result in "<coroutine object ...>" being returned as string.
+        
         # Safety Truncation: Prevent prompt injection via massive inputs
         safe_message = user_message[:1000] if len(user_message) > 1000 else user_message
         
@@ -232,8 +245,9 @@ class ConversationOrchestrator:
             yield response
             return
 
-        # Handle make_booking with slot-filling conversation manager
-        if state.current_intent == "make_booking" or state.awaiting_confirmation:
+        # Handle make_booking AND check_availability with slot-filling conversation manager
+        # We group them because checking availability usually requires the same slots (date/time/party)
+        if state.current_intent in ["make_booking", "check_availability"] or state.awaiting_confirmation:
             response = await self.booking_manager.handle_booking_conversation(state, user_message)
             state.conversation_history.append(AIMessage(content=response))
             logger.info(f"Updated session state: {state}")
@@ -241,13 +255,8 @@ class ConversationOrchestrator:
             return
 
         # For other intents, use the routing logic
-        if state.current_intent == "check_availability":
-            # Direct it to check availability logic is possible, but currently it routes to booking_query_executor
-            # The booking_query_executor has tools: [cancel_booking, find_booking, update_booking]
-            # It DOES NOT have checking_availability tool because that's usually part of make_booking flow
-            # We should probably add check_availability to the booking_query_executor tools list if we want it to work standalone.
-            pass
-            
+        # ... logic for update/cancel/find/menu etc ...
+        
         full_orchestrator_chain = RunnableBranch(
             (
                 lambda x: x["current_intent"]
@@ -255,17 +264,8 @@ class ConversationOrchestrator:
                     "update_booking",
                     "cancel_booking",
                     "find_booking",
-                    # "check_availability", # Moved check avail to a specialized flow or ensure tool is present
                 ],
                 self.booking_query_executor
-            ),
-             (
-                lambda x: x["current_intent"] == "check_availability",
-                 # Temporary: check availability usually implies making a booking for that slot
-                 # So we route it to booking manager to begin capturing details
-                 # lambda x: self.booking_manager.handle_booking_conversation(state, user_message) # Can't do this easily in RunnableBranch
-                 # Better to fallback to booking executor IF it has the tool.
-                 self.booking_query_executor
             ),
             (
                 lambda x: x["current_intent"] == "search_menu",
