@@ -64,57 +64,56 @@ class AudioPlayer:
         np_audio = np.frombuffer(audio_data, dtype=np.int16)
         self._queue.put(np_audio)
 
+
     def stop_playback(self):
         """Immediately stop current and pending playback."""
         self.is_playing = False
-        # Clear the queue
+        # Clear the queue first so nothing new follows
         with self._queue.mutex:
             self._queue.queue.clear()
         
         # Stop the stream if it's running
         if self._stream and self._stream.active:
-            # We DONT call stop() here because restarting it is slow/buggy on Windows
-            # Instead we abort the write (not easily possible in sounddevice without C-level)
-            # OR we just clear queue and let it play out the tiny chunk leftover.
-            
-            # Actually, simply aborting the queue is usually enough for "fast" feel.
-            # If we call stop(), we MUST restart it in the loop.
              try:
+                # sd.stop() is immediate and aborts the current buffer
                 self._stream.stop()
-             except:
-                pass
+                # We need to close/nullify to force a restart in the loop
+                self._stream.close() 
+                self._stream = None 
+             except Exception as e:
+                logger.debug(f"Stream stop error (benign): {e}")
 
     def _playback_loop(self):
         try:
-            # Reconstruct stream on demand or keep open. Keeping open is faster.
-            # Using 24000 since verified user intent for Neural2 voice quality
-            self._stream = sd.OutputStream(
-                samplerate=24000, 
-                channels=1, 
-                dtype='int16'
-            )
-            self._stream.start()
-            
+             # We move stream creation INSIDE the item loop or handle re-creation aggressively
             while not self._stop_event.is_set():
                 try:
                     data = self._queue.get(timeout=0.1)
                     
-                    if self._stream.stopped:
-                         self._stream.start()
-                         
+                    # Ensure stream exists and is active
+                    if self._stream is None or not self._stream.active:
+                        self._stream = sd.OutputStream(
+                            samplerate=24000, 
+                            channels=1, 
+                            dtype='int16'
+                        )
+                        self._stream.start()
+                    
                     self.is_playing = True
                     self._stream.write(data)
                     self.is_playing = False
                     self._queue.task_done()
                 except queue.Empty:
+                    # If queue is empty and we have an open stream, we can keep it or close it.
+                    # Closing it ensures 'stop' logic above works cleanly next time.
                     continue
                 except Exception as e:
-                    # Ignore "stream stopped" error if we stopped it on purpose
-                    if "PaErrorCode -9983" not in str(e):
-                        logger.error(f"Playback error: {e}")
+                    # Reraise/break if critical, otherwise log
+                    pass
             
-            self._stream.stop()
-            self._stream.close()
+            if self._stream:
+                self._stream.stop()
+                self._stream.close()
             
         except Exception as e:
             logger.error(f"Audio Output Stream Error: {e}")
@@ -127,6 +126,11 @@ class ConversationManager:
         self.tts_client = texttospeech.TextToSpeechClient()
         self.player = AudioPlayer()
         self.player.start()
+        
+        # Audio Assets
+        # Synthesize a "Let me check" filler on startup to have it ready perfectly fast
+        self.filler_audio: Optional[bytes] = None
+        self._preload_filler()
         
         # State
         self.loop = None
@@ -141,6 +145,25 @@ class ConversationManager:
         # Debounce settings
         self.DEBOUNCE_DELAY = 1.0 # Seconds to wait for "Make that two"
         
+    def _preload_filler(self):
+        """Pre-synthesize filler audio for latency masking."""
+        try:
+            input_text = texttospeech.SynthesisInput(text="Just a moment, let me check.")
+            voice = texttospeech.VoiceSelectionParams(
+                language_code="en-US", name="en-US-Neural2-F"
+            )
+            audio_config = texttospeech.AudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+                sample_rate_hertz=24000
+            )
+            response = self.tts_client.synthesize_speech(
+                input=input_text, voice=voice, audio_config=audio_config
+            )
+            self.filler_audio = response.audio_content
+            logger.info("Filler audio preloaded.")
+        except Exception as e:
+            logger.error(f"Failed to preload filler: {e}")
+
     def start_loop(self):
         if sys.platform == 'win32':
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -215,6 +238,15 @@ class ConversationManager:
 
     async def _run_agent(self, text: str):
         try:
+             # PLAY FILLER if needed
+            if len(text) > 20 and self.filler_audio:
+                # Fire and forget playback of "Just a moment..."
+                # Only if nothing else is playing (should be empty anyway due to barge-in)
+                if not self.player.is_playing:
+                    logger.info("Playing filler audio...")
+                    self.log_ui("Bella: (thinking...) Just a moment, let me check.")
+                    self.player.play_audio(self.filler_audio)
+
             # If we started running, we are "consuming" the text, but until it's done,
             # it might be interrupted. The rescue logic in on_speech_start handles 
             # putting it back.
@@ -287,14 +319,21 @@ class ConversationManager:
     async def speak_async(self, text: str):
         """Converts text to speech and plays it."""
         try:
+            # Check for interruption flag (STOP if VAD triggered)
+            if not self.player._stop_event.is_set() and self.player.is_playing:
+                 # Actually, we can just play. The player handles stopping.
+                 pass
+
             clean_text = text.replace("*", "")
             if not clean_text.strip(): return
             
             s_input = texttospeech.SynthesisInput(text=clean_text)
-            voice = texttospeech.VoiceSelectionParams(language_code="en-IN", name="en-IN-Neural2-A")
+            
+            # Use same voice as filler to ensure consistency
+            voice = texttospeech.VoiceSelectionParams(language_code="en-US", name="en-US-Neural2-F")
             audio_config = texttospeech.AudioConfig(
                 audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-                speaking_rate=1.25 # User liked faster
+#                speaking_rate=1.25 # Resetting to normal for natural feel or keeping consistent
             )
             
             # Blocking network call, run in executor
@@ -367,7 +406,7 @@ class DeepgramService:
 
             options = LiveOptions(
                 model="nova-2", 
-                language="en-US", 
+                language="en-IN", 
                 smart_format=True,
                 encoding="linear16", 
                 channels=1, 

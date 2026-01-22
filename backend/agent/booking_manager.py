@@ -74,6 +74,9 @@ class BookingManager:
             "- If the user just provides a time (e.g., '11am'), DO NOT output 'date' unless they explicitly said 'today' or a day name.\n"
             "- If valid info exists in history (e.g. date=2024-01-24), DO NOT OVERWRITE IT with 'today's' date unless the user explicitly changed it.\n"
             "- Return null/None for fields that are not mentioned or implied in the current turn.\n"
+            "CONFLICT RESOLUTION (CRITICAL):\n"
+            "- If the input contains self-corrections (e.g. 'Table for 5, actually 6', 'Saturday... no wait, Sunday'), ALWAYS extract the FINAL intention.\n"
+            "- Use the 'reasoning' field to explain the correction (e.g. 'User initially said 5 but corrected to 6').\n"
             "TIME PARSING:\n"
             '- "6:30 pm" -> "18:30"\n'
             '- "2 pm" -> "14:00"\n'
@@ -117,10 +120,19 @@ class BookingManager:
                 
                 # Update slot with extracted information
                 if result.party_size is not None:
+                    # Intelligence Check:
+                    # If party_size changes abruptly (e.g., from 7 to 1) without explicit correction,
+                    # it might be a misunderstanding of "Me" (could mean 'add me' or 'just me').
+                    # For now, we trust the LLM reasoning, but we log it.
+                    if current_slot.party_size and current_slot.party_size != result.party_size:
+                        logger.info(f"Party size update detected: {current_slot.party_size} -> {result.party_size}")
+                    
                     current_slot.party_size = result.party_size
                 
                 # Logic to prevent date overwriting with defaults
                 if result.date:
+                    if current_slot.date and current_slot.date != result.date:
+                         logger.info(f"Date update detected: {current_slot.date} -> {result.date}")
                     # Only update if the result.date is different from current or if we had none
                     current_slot.date = result.date
                 
@@ -141,7 +153,13 @@ class BookingManager:
                              # Handle "14" -> "14:00"
                              current_slot.time = f"{int(t):02d}:00"
                         else:
-                            current_slot.time = result.time
+                            final_time_str = result.time
+                            
+                        # Compare logic
+                        if current_slot.time and current_slot.time != final_time_str:
+                             logger.info(f"Time update detected: {current_slot.time} -> {final_time_str}")
+                             
+                        current_slot.time = final_time_str
                     except Exception as e:
                         logger.warning(f"Time parsing fallback failed for '{result.time}': {e}")
                         current_slot.time = result.time
@@ -169,14 +187,37 @@ class BookingManager:
         return current_slot
     
     async def _generate_natural_refusal(self, instruction: str) -> str:
-        """Uses LLM to generate a polite, natural refusal based on business logic."""
+        """Uses LLM to generate a natural response based on instruction."""
         prompt = ChatPromptTemplate.from_messages([
             ("system", 
-             "You are Bella, a friendly restaurant hostess. The system has rejected a user's request. "
-             "Explain the rejection naturally and politely ask for an alternative. "
-             "Keep it short (1-2 sentences). Do NOT apologize excessively."
+             "You are Bella, a friendly restaurant hostess. "
+             "Task: Communicate the system's response to the user.\n"
+             "Style: Polite, natural, warm, and concise (1-2 sentences).\n"
+             "Rules: Do NOT apologize excessively. Focus on the solution."
             ),
             ("human", f"System Instruction: {instruction}")
+        ])
+        chain = prompt | self.llm
+        response = await chain.ainvoke({})
+        return response.content
+
+
+    async def _generate_success_response(self, slot: BookingSlot, user_message: str) -> str:
+        """Generate a natural success/confirmation message, addressing any side questions."""
+        system_prompt = (
+            "You are Bella, a professional restaurant hostess.\n"
+            "We have all the necessary booking details and found a table.\n"
+            f"Booking: Table for {slot.party_size} on {slot.date} at {slot.time} under {slot.name}.\n"
+            f"User's Last Message: \"{user_message}\"\n\n"
+            "TASK: Ask the user to CONFIRM the booking details.\n"
+            "CRITICAL RULES:\n"
+            "1. SIDE QUESTIONS: If the user asked a question in their last message (e.g. 'parking?', 'vegan?'), ANSWER IT FIRST.\n"
+            "2. CONFIRMATION: Then, state the booking details clearly and ask 'Shall I confirm?'\n"
+            "3. STYLE: Conversational, warm, short."
+        )
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("human", "Generate the confirmation response.")
         ])
         chain = prompt | self.llm
         response = await chain.ainvoke({})
@@ -273,12 +314,7 @@ class BookingManager:
                 if "available" in availability.lower():
                     # Confirm with user
                     state.awaiting_confirmation = True
-                    return (
-                        f"Great! Table for {state.booking_slot.party_size} "
-                        f"on {self._format_date_friendly(state.booking_slot.date)} at "
-                        f"{self._format_time_friendly(state.booking_slot.time)} "
-                        f"under {state.booking_slot.name or state.caller_name}. Shall I confirm that?"
-                    )
+                    return await self._generate_success_response(state.booking_slot, user_message)
                 else:
                     # Not available, inform user
                     state.booking_slot.time = None  # Clear time so they can pick another
@@ -289,7 +325,7 @@ class BookingManager:
         
         # We're missing information, ask for it naturally
         missing = state.booking_slot.get_missing_fields()
-        return await self._ask_for_missing_info(missing, state.booking_slot)
+        return await self._ask_for_missing_info(missing, state.booking_slot, user_message)
     
     def _is_confirmation(self, message: str) -> bool:
         """Check if message is a confirmation."""
@@ -302,8 +338,8 @@ class BookingManager:
         return any(word in message.lower() for word in rejections)
     
     
-    async def _ask_for_missing_info(self, missing: list[str], slot: BookingSlot) -> str:
-        """Generate a natural question for missing information using LLM."""
+    async def _ask_for_missing_info(self, missing: list[str], slot: BookingSlot, user_input_context: str = "") -> str:
+        """Generate a natural question for missing information using LLM, handling side questions."""
         
         # Build a context string describing what we already know
         known_info = []
@@ -319,24 +355,27 @@ class BookingManager:
             "You are Bella, a professional restaurant hostess.\n"
             "Your goal is to collect missing reservation details from the user.\n"
             f"Current Known Info: {known_str}\n"
-            f"Missing Info: {missing_str}\n\n"
-            "TASK: Ask the user for the MISSING information naturally.\n"
-            "RULES:\n"
-            "- If 'party_size' is missing, ask for number of guests.\n"
-            "- If 'date' is missing, ask when they would like to come.\n"
-            "- If 'time' is missing, ask for the preferred time.\n"
-            "- If 'name' is missing, ask for the booking name.\n"
-            "- DO NOT ask for information we already have.\n"
-            "- Keep it short (1 sentence ideally).\n"
-            "- Be conversational, not robotic.\n"
-            "- If asking for time on a Weekend (Sat/Sun), mention we are open 12 PM - 11 PM.\n"
-            "- If asking for time on a Weekday, mention we are open 5 PM - 11 PM.\n"
-            "- Example: 'Great! And what time works best for you on Saturday?'"
+            f"Missing Info: {missing_str}\n"
+            f"User's Last Message: \"{user_input_context}\"\n\n"
+            "TASK: Generate the response to the user.\n"
+            "CRITICAL RULES:\n"
+            "1. SIDE QUESTIONS: If the user asked a question in their last message (e.g. 'Do you have parking?', 'Is it vegan?'), ANSWER IT FIRST briefly.\n"
+            "   - Parking: Yes, we have valet.\n"
+            "   - Vegan: Yes, we have a separate vegan menu.\n"
+            "   - Dress code: Casual elegant.\n"
+            "2. THEN ASK FOR MISSING INFO: After answering (if needed), ask for the missing details naturally.\n"
+            "3. SPECIFIC MISSING INFO RULES:\n"
+            "   - 'party_size': Ask for number of guests.\n"
+            "   - 'date': Ask when they would like to come.\n"
+            "   - 'time': Ask for preferred time. (Weekends: Open 12-11 PM, Weekdays: 5-11 PM).\n"
+            "   - 'name': Ask for booking name.\n"
+            "4. STYLE: Conversational, warm, short (1-2 sentences). Don't repeat info we have.\n"
+            "5. Example: 'Yes, we have valet parking! Now, how many guests will be joining you?'"
         )
         
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
-            ("human", "Generate the next question.")
+            ("human", "Generate the response.")
         ])
         
         chain = prompt | self.llm
