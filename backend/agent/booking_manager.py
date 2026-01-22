@@ -75,15 +75,17 @@ class BookingManager:
             "- If valid info exists in history (e.g. date=2024-01-24), DO NOT OVERWRITE IT with 'today's' date unless the user explicitly changed it.\n"
             "- Return null/None for fields that are not mentioned or implied in the current turn.\n"
             "CONFLICT RESOLUTION (CRITICAL):\n"
-            "- If the input contains self-corrections (e.g. 'Table for 5, actually 6', 'Saturday... no wait, Sunday'), ALWAYS extract the FINAL intention.\n"
+            "- If the input contains self-corrections (e.g. 'Table for 5, actually 6', 'Saturday... no wait, Sunday', 'I meant today'), ALWAYS extract the FINAL intention.\n"
             "- Use the 'reasoning' field to explain the correction (e.g. 'User initially said 5 but corrected to 6').\n"
+            "- IF YOU DETECT A CORRECTION, YOU MUST OUTPUT THE NEW VALUE. Do not return null for that field.\n"
+            f"- Example: User says 'I meant today'. Reasoning: 'User corrected date to today'. Output: {{{{ 'date': '{dates['today'].strftime('%Y-%m-%d')}' }}}}\n"
             "TIME PARSING:\n"
             '- "6:30 pm" -> "18:30"\n'
             '- "2 pm" -> "14:00"\n'
             '- "7" -> "19:00" (if dinner context implication)\n'
             '- DO NOT AUTOCORRECT times to match opening hours. If user says "11am", output "11:00". If user says "2pm", output "14:00". The system will handle validation.\n\n'
-            "{format_instructions}"
-        )
+            "{format_instructions}")
+        
     
     async def extract_info(self, user_message: str, current_slot: BookingSlot, chat_history: list[BaseMessage] = []) -> BookingSlot:
         """Extract booking info from user message and update the slot with retry logic."""
@@ -359,10 +361,12 @@ class BookingManager:
             f"User's Last Message: \"{user_input_context}\"\n\n"
             "TASK: Generate the response to the user.\n"
             "CRITICAL RULES:\n"
-            "1. SIDE QUESTIONS: If the user asked a question in their last message (e.g. 'Do you have parking?', 'Is it vegan?'), ANSWER IT FIRST briefly.\n"
-            "   - Parking: Yes, we have valet.\n"
-            "   - Vegan: Yes, we have a separate vegan menu.\n"
-            "   - Dress code: Casual elegant.\n"
+            "1. SIDE QUESTIONS: CHECK if the user explicitly asked a question in their last message (e.g. 'Do you have parking?', 'Is it vegan?').\n"
+            "   - IF AND ONLY IF they asked, answer it first briefly.\n"
+            "   - EXAMPLES of answers (only use if asked):\n"
+            "     - Parking: 'Yes, we have valet.'\n"
+            "     - Vegan: 'Yes, we have a separate vegan menu.'\n"
+            "   - IF NO QUESTION detected, DO NOT invent an answer.\n"
             "2. THEN ASK FOR MISSING INFO: After answering (if needed), ask for the missing details naturally.\n"
             "3. SPECIFIC MISSING INFO RULES:\n"
             "   - 'party_size': Ask for number of guests.\n"
@@ -370,7 +374,8 @@ class BookingManager:
             "   - 'time': Ask for preferred time. (Weekends: Open 12-11 PM, Weekdays: 5-11 PM).\n"
             "   - 'name': Ask for booking name.\n"
             "4. STYLE: Conversational, warm, short (1-2 sentences). Don't repeat info we have.\n"
-            "5. Example: 'Yes, we have valet parking! Now, how many guests will be joining you?'"
+            "5. Example: 'Now, how many guests will be joining you?'"
+            "6. Answer only as much as asked oir needed to be asked do not extend queries beyond that."
         )
         
         prompt = ChatPromptTemplate.from_messages([

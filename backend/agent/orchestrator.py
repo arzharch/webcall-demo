@@ -254,74 +254,71 @@ class ConversationOrchestrator:
             yield response
             return
 
-        # For other intents, use the routing logic
-        # ... logic for update/cancel/find/menu etc ...
+        # For other intents, use manual routing instead of RunnableBranch for better control
+        # over buffering and error handling (specifically for ERROR_GIBBERISH)
         
-        full_orchestrator_chain = RunnableBranch(
-            (
-                lambda x: x["current_intent"]
-                in [
-                    "update_booking",
-                    "cancel_booking",
-                    "find_booking",
-                ],
-                self.booking_query_executor
-            ),
-            (
-                lambda x: x["current_intent"] == "search_menu",
-                self.menu_agent_executor
-            ),
-            self.general_conversation_chain,
-        )
+        executor = None
+        is_general = False
+        
+        if state.current_intent in ["update_booking", "cancel_booking", "find_booking"]:
+            executor = self.booking_query_executor
+        elif state.current_intent == "search_menu":
+            executor = self.menu_agent_executor
+        else:
+            is_general = True
 
-        # Prepare input for the full orchestrator chain
+        # Prepare input for the chain/executor
         chain_input = {
             "input": user_message,
-            "chat_history": state.conversation_history[:-1],  # Pass history excluding current user message (it's 'input')
-            "current_intent": state.current_intent,  # Pass current intent for the branch condition
+            "chat_history": state.conversation_history[:-1],
+            "current_intent": state.current_intent,
         }
 
         full_response = ""
-        # Invoke the chosen chain and stream its output
-        async for chunk in full_orchestrator_chain.astream(chain_input):
-            # Process chunks based on whether they come from an AgentExecutor or a simple LLM chain
-            content_to_yield = ""
-            
-            if isinstance(chunk, dict):
-                if "output" in chunk:
-                    content_to_yield = chunk["output"]
-                elif "messages" in chunk:
-                    for msg in chunk["messages"]:
-                        if isinstance(msg, AIMessage):
-                            content_to_yield += msg.content
-                if "actions" in chunk:
-                    for action in chunk["actions"]:
-                        logger.info(f"Agent Action: {action.tool} - {action.tool_input}")
-                if "steps" in chunk:
-                    for step in chunk["steps"]:
-                        logger.info(f"Tool Observation: {step.observation}")
-            elif isinstance(chunk, AIMessage):
-                content_to_yield = chunk.content
-            else:
-                content_to_yield = str(chunk)
 
-            # Check for specific error tokens from General Chain
+        if is_general:
+            # Buffer general responses to safely check for ERROR_GIBBERISH without token splitting issues
+            response_msg = await self.general_conversation_chain.ainvoke(chain_input)
+            content_to_yield = response_msg.content
+            
             if "ERROR_GIBBERISH" in content_to_yield:
                 state.confusion_count += 1
                 if state.confusion_count >= 2:
                     content_to_yield = "I'm having trouble understanding. A human agent will call you back soon to assist you."
-                    # Reset or end session logic could go here
                 else:
                     content_to_yield = "I didn't quite get that. Could you please rephrase?"
             else:
-                # Reset confusion count if we got a normal response (implying normal input)
-                # But only if it's not a streaming chunk in the middle of a sentence
-                # Ideally check at the end, but for simplicity:
-                if len(content_to_yield.strip()) > 5:
+                 if len(content_to_yield.strip()) > 5:
                      state.confusion_count = 0
-
+            
             full_response += content_to_yield
             yield content_to_yield
+            
+        else:
+            # Stream from AgentExecutor
+            async for chunk in executor.astream(chain_input):
+                content_to_yield = ""
+                
+                if isinstance(chunk, dict):
+                    if "output" in chunk:
+                        content_to_yield = chunk["output"]
+                    elif "messages" in chunk:
+                        for msg in chunk["messages"]:
+                            if isinstance(msg, AIMessage):
+                                content_to_yield += msg.content
+                    if "actions" in chunk:
+                        for action in chunk["actions"]:
+                            logger.info(f"Agent Action: {action.tool} - {action.tool_input}")
+                    if "steps" in chunk:
+                        for step in chunk["steps"]:
+                            logger.info(f"Tool Observation: {step.observation}")
+                elif isinstance(chunk, AIMessage):
+                    content_to_yield = chunk.content
+                else:
+                    content_to_yield = str(chunk)
+
+                full_response += content_to_yield
+                yield content_to_yield
 
         # Append the AI's full response to the conversation history
         state.conversation_history.append(AIMessage(content=full_response))

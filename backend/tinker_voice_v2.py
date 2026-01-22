@@ -150,7 +150,7 @@ class ConversationManager:
         try:
             input_text = texttospeech.SynthesisInput(text="Just a moment, let me check.")
             voice = texttospeech.VoiceSelectionParams(
-                language_code="en-US", name="en-US-Neural2-F"
+                language_code="en-IN", name="en-IN-Neural2-A"
             )
             audio_config = texttospeech.AudioConfig(
                 audio_encoding=texttospeech.AudioEncoding.LINEAR16,
@@ -225,6 +225,9 @@ class ConversationManager:
 
     async def _process_buffer(self):
         if not self.input_buffer: return
+        
+        # Super-Safety: Kill any lingering audio from previous turns before starting new thought
+        self.player.stop_playback()
         
         full_text = " ".join(self.input_buffer)
         self.input_buffer = [] # Clear immediately so new speech fills new buffer
@@ -319,9 +322,13 @@ class ConversationManager:
     async def speak_async(self, text: str):
         """Converts text to speech and plays it."""
         try:
-            # Check for interruption flag (STOP if VAD triggered)
+            # Check for interruption flag (STOP if VAD triggered or player stopped)
+            # If the stop event is set, it means we recently cancelled. Don't queue new stuff.
+            if self.player._stop_event.is_set():
+                 logger.info("Skipping speak_async due to stop event.")
+                 return
+
             if not self.player._stop_event.is_set() and self.player.is_playing:
-                 # Actually, we can just play. The player handles stopping.
                  pass
 
             clean_text = text.replace("*", "")
@@ -330,10 +337,10 @@ class ConversationManager:
             s_input = texttospeech.SynthesisInput(text=clean_text)
             
             # Use same voice as filler to ensure consistency
-            voice = texttospeech.VoiceSelectionParams(language_code="en-US", name="en-US-Neural2-F")
+            voice = texttospeech.VoiceSelectionParams(language_code="en-IN", name="en-IN-Neural2-A")
             audio_config = texttospeech.AudioConfig(
                 audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-#                speaking_rate=1.25 # Resetting to normal for natural feel or keeping consistent
+                speaking_rate=1.25 # Resetting to normal for natural feel or keeping consistent
             )
             
             # Blocking network call, run in executor
@@ -342,6 +349,11 @@ class ConversationManager:
                 lambda: self.tts_client.synthesize_speech(input=s_input, voice=voice, audio_config=audio_config)
             )
             
+            # CHECK AGAIN: If stopped during synthesis, do not play
+            if self.player._stop_event.is_set():
+                 logger.info("Discarding audio (stop event set during synthesis).")
+                 return
+
             self.player.play_audio(response.audio_content)
             
         except Exception as e:

@@ -159,20 +159,44 @@ def find_booking(name: str | None = None, booking_id: int | None = None) -> str:
 
 @tool
 def update_booking(
-    booking_id: int,
+    booking_id: int | str,
     new_party_size: int | None = None,
     new_date_str: str | None = None,
     new_time_str: str | None = None,
+    name: str | None = None,
 ) -> str:
     """
-    Update an existing booking's party size, date, or time.
+    Update an existing booking's party size, date, time, or name.
 
     Args:
         booking_id: The ID of the booking to update.
         new_party_size: The new number of people in the party.
         new_date_str: The new date for the reservation.
         new_time_str: The new time for the reservation.
+        name: The new name for the reservation.
     """
+    # Robustness: Handle case where Agent passes a JSON string as the first argument
+    # because it thinks the tool takes a single string input.
+    if isinstance(booking_id, str):
+        booking_id = booking_id.strip()
+        if booking_id.startswith("{") and booking_id.endswith("}"):
+            try:
+                data = json.loads(booking_id)
+                # Remap fields
+                booking_id = data.get("booking_id", booking_id)
+                new_party_size = data.get("new_party_size", new_party_size)
+                new_date_str = data.get("new_date_str", new_date_str)
+                new_time_str = data.get("new_time_str", new_time_str)
+                name = data.get("name", name)
+            except json.JSONDecodeError:
+                pass # Try to use as is (maybe it's a string ID?)
+        
+        # Try to convert to int if it's numeric
+        try:
+             booking_id = int(booking_id)
+        except (ValueError, TypeError):
+             pass # Keep as string or whatever it ended up as
+
     tickets = get_existing_tickets()
     ticket_idx = -1
     for i, t in enumerate(tickets):
@@ -186,8 +210,11 @@ def update_booking(
     ticket = tickets[ticket_idx]
     original_datetime = datetime.fromisoformat(ticket["datetime"])
 
-    if new_party_size:
+    if new_party_size is not None:
         ticket["party_size"] = new_party_size
+    
+    if name is not None:
+        ticket["name"] = name
 
     new_date = new_date_str or original_datetime.strftime("%Y-%m-%d")
     new_time = new_time_str or original_datetime.strftime("%H:%M")
