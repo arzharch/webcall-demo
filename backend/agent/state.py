@@ -57,3 +57,4 @@ class SessionState(BaseModel):
     booking_slot: BookingSlot = Field(default_factory=BookingSlot)
     awaiting_confirmation: bool = False  # True when we've asked user to confirm booking
     confusion_count: int = 0  # Track consecutive gibberish/confusion messages
+    last_booking_id: Optional[int] = None  # Track last successful booking for updates/cancellations

@@ -33,16 +33,24 @@ class BookingManager:
     def _get_date_context(self) -> dict:
         """Get current date context for extraction."""
         today = datetime.now()
+        
+        def get_next_weekday(target_day: int) -> datetime:
+            """Get next occurrence of target_day (0=Mon, 6=Sun). If today, return 7 days later."""
+            days_ahead = (target_day - today.weekday() + 7) % 7
+            if days_ahead == 0:  # If today is the target day, user likely means next week
+                days_ahead = 7
+            return today + timedelta(days=days_ahead)
+        
         return {
             "today": today,
             "tomorrow": today + timedelta(days=1),
-            "saturday": today + timedelta(days=(5 - today.weekday()) % 7 or 7),
-            "friday": today + timedelta(days=(4 - today.weekday()) % 7 or 7),
-            "sunday": today + timedelta(days=(6 - today.weekday()) % 7 or 7),
-            "monday": today + timedelta(days=(0 - today.weekday()) % 7 or 7),
-            "tuesday": today + timedelta(days=(1 - today.weekday()) % 7 or 7),
-            "wednesday": today + timedelta(days=(2 - today.weekday()) % 7 or 7),
-            "thursday": today + timedelta(days=(3 - today.weekday()) % 7 or 7),
+            "monday": get_next_weekday(0),
+            "tuesday": get_next_weekday(1),
+            "wednesday": get_next_weekday(2),
+            "thursday": get_next_weekday(3),
+            "friday": get_next_weekday(4),
+            "saturday": get_next_weekday(5),
+            "sunday": get_next_weekday(6),
         }
     
     def _build_extraction_prompt(self) -> str:
@@ -69,11 +77,11 @@ class BookingManager:
             f'- "sunday" -> {dates["sunday"].strftime("%Y-%m-%d")}\n'
             f'- "monday" -> {dates["monday"].strftime("%Y-%m-%d")}\n'
             '- Any other day name -> find next occurrence\n\n'
-            "CRITICAL - STATE PRESERVATION:\n"
-            "- Only extract NEW or CHANGED information.\n"
-            "- If the user just provides a time (e.g., '11am'), DO NOT output 'date' unless they explicitly said 'today' or a day name.\n"
-            "- If valid info exists in history (e.g. date=2024-01-24), DO NOT OVERWRITE IT with 'today's' date unless the user explicitly changed it.\n"
-            "- Return null/None for fields that are not mentioned or implied in the current turn.\n"
+            "CRITICAL - EXTRACTION RULES:\n"
+            "- Extract ONLY fields that are explicitly mentioned or strongly implied in the current turn.\n"
+            "- If the user just provides a time (e.g., '11am'), extract only time, NOT date.\n"
+            "- For fields NOT mentioned: return None/null. The system will preserve existing values.\n"
+            "- EXCEPTION: If user says 'change to X' or 'actually Y', extract the new value even if field was previously set.\n"
             "CONFLICT RESOLUTION (CRITICAL):\n"
             "- If the input contains self-corrections (e.g. 'Table for 5, actually 6', 'Saturday... no wait, Sunday', 'I meant today'), ALWAYS extract the FINAL intention.\n"
             "- Use the 'reasoning' field to explain the correction (e.g. 'User initially said 5 but corrected to 6').\n"
@@ -82,8 +90,12 @@ class BookingManager:
             "TIME PARSING:\n"
             '- "6:30 pm" -> "18:30"\n'
             '- "2 pm" -> "14:00"\n'
-            '- "7" -> "19:00" (if dinner context implication)\n'
-            '- DO NOT AUTOCORRECT times to match opening hours. If user says "11am", output "11:00". If user says "2pm", output "14:00". The system will handle validation.\n\n'
+            '- "9:30" or "nine thirty" WITHOUT am/pm -> Context matters:\n'
+            '  * If user is booking dinner/evening -> assume PM (21:30)\n'
+            '  * Restaurants typically don\'t open at 9:30 AM, so default to PM\n'
+            '  * Use the reasoning field to explain your interpretation\n'
+            '- "7" alone -> "19:00" (dinner context - 7 PM)\n'
+            '- DO NOT AUTOCORRECT times to match opening hours. If user says "11am", output "11:00". The system will validate.\n\n'
             "{format_instructions}")
         
     
@@ -165,8 +177,26 @@ class BookingManager:
                     except Exception as e:
                         logger.warning(f"Time parsing fallback failed for '{result.time}': {e}")
                         current_slot.time = result.time
+                
+                # NAME VALIDATION: Only update name if it seems intentional
+                # Avoid overwriting with companion names (e.g., "me and Echo" shouldn't set name to "Echo")
                 if result.name:
-                    current_slot.name = result.name
+                    # Check if this looks like a booking name vs. a mentioned companion
+                    # Heuristic: Don't overwrite if message contains "and" + the extracted name (likely a companion)
+                    user_msg_lower = user_message.lower()
+                    name_lower = result.name.lower()
+                    
+                    is_companion_mention = (
+                        (" and " + name_lower in user_msg_lower) or 
+                        (name_lower + " and " in user_msg_lower)
+                    )
+                    
+                    if not is_companion_mention:
+                        current_slot.name = result.name
+                        logger.info(f"Updated booking name to: {result.name}")
+                    else:
+                        logger.info(f"Skipping name update - '{result.name}' appears to be a companion mention")
+                
                 if result.notes:
                     current_slot.notes = result.notes
                 
@@ -243,8 +273,23 @@ class BookingManager:
                  logger.info(f"Applied caller name to booking slot: {normalized_name}")
 
         if state.awaiting_confirmation:
-            if self._is_confirmation(user_message):
-                # User confirmed, actually make the booking
+            # FIX #16: Handle corrections during confirmation (e.g., "Yes, but make it 8pm")
+            # Check for confirmation with modifications
+            has_confirmation_word = self._is_confirmation(user_message)
+            has_modification_word = any(word in user_message.lower() for word in [
+                'but', 'except', 'change', 'actually', 'make it', 'switch', 'different'
+            ])
+            
+            if has_confirmation_word and has_modification_word:
+                # User is confirming but with a change: "Yes but 8pm" or "Confirm but change name to Bob"
+                logger.info("Detected confirmation with modification - extracting changes")
+                # Extract the modification
+                state.booking_slot = await self.extract_info(user_message, state.booking_slot, state.conversation_history)
+                # Stay in confirmation mode - show updated details and ask again
+                return await self._generate_success_response(state.booking_slot, user_message)
+                
+            elif has_confirmation_word:
+                # Pure confirmation with no modifications
                 result = make_booking.invoke({
                     "name": state.booking_slot.name or state.caller_name,
                     "party_size": state.booking_slot.party_size,
@@ -252,11 +297,19 @@ class BookingManager:
                     "time_str": state.booking_slot.time,
                     "notes": state.booking_slot.notes
                 })
+                
+                # Extract booking ID from result for future updates/cancellations
+                import re
+                booking_id_match = re.search(r'booking ID is (\d+)', result)
+                if booking_id_match:
+                    state.last_booking_id = int(booking_id_match.group(1))
+                    logger.info(f"Saved last_booking_id: {state.last_booking_id}")
+                
                 state.awaiting_confirmation = False
                 state.booking_slot = BookingSlot()  # Reset
                 return result
             else:
-                # User rejected or is providing new info (e.g., "No, actually 5 people")
+                # User rejected or is providing completely new info (e.g., "No, actually 5 people")
                 # Clear the flag and proceed to extraction
                 state.awaiting_confirmation = False
 

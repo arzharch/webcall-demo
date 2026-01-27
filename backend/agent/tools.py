@@ -10,6 +10,8 @@ DATA_DIR = Path(__file__).parent.parent / "data"
 TICKETS_FILE = DATA_DIR / "tickets.json"
 RESTAURANT_KB_FILE = DATA_DIR / "restaurant_kb.json"
 
+# FIX #12: Cache restaurant KB in memory to avoid disk I/O on every menu query
+_RESTAURANT_KB_CACHE: dict = None
 
 def get_existing_tickets() -> List[dict]:
     """Get all existing tickets."""
@@ -19,11 +21,20 @@ def get_existing_tickets() -> List[dict]:
         return json.load(f)
 
 def load_restaurant_kb() -> dict:
-    """Load the restaurant knowledge base."""
+    """Load the restaurant knowledge base. Cached after first load."""
+    global _RESTAURANT_KB_CACHE
+    
+    if _RESTAURANT_KB_CACHE is not None:
+        return _RESTAURANT_KB_CACHE
+    
     if not RESTAURANT_KB_FILE.exists():
-        return {"menu": [], "faq": []}
+        _RESTAURANT_KB_CACHE = {"menu": [], "faq": []}
+        return _RESTAURANT_KB_CACHE
+    
     with open(RESTAURANT_KB_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
+        _RESTAURANT_KB_CACHE = json.load(f)
+    
+    return _RESTAURANT_KB_CACHE
 
 @tool
 def check_availability(

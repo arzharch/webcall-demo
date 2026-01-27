@@ -7,10 +7,18 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import Runnable, RunnableBranch, RunnableLambda, RunnablePassthrough
 
+# FIX #17: Switch from ReAct to OpenAI function calling for better tool reliability
 try:
-    from langchain.agents import AgentExecutor, create_react_agent
-except ImportError:  # Fallback for older LangChain installs
-    from langchain_classic.agents import AgentExecutor, create_react_agent
+    from langchain.agents import AgentExecutor, create_openai_tools_agent
+    USE_OPENAI_TOOLS = True
+except ImportError:
+    try:
+        from langchain.agents import AgentExecutor, create_react_agent
+        USE_OPENAI_TOOLS = False
+    except ImportError:  # Fallback for older LangChain installs
+        from langchain_classic.agents import AgentExecutor, create_react_agent
+        USE_OPENAI_TOOLS = False
+
 from loguru import logger
 
 from agent.state import SessionState, Intent
@@ -57,8 +65,8 @@ class ConversationOrchestrator:
         self, llm: BaseChatModel, tools: List[Callable], system_message_prefix: str
     ) -> AgentExecutor:
         """
-        Builds a LangChain AgentExecutor for handling tool calls and conversational turns,
-        specialized for a given set of tools.
+        Builds a LangChain AgentExecutor for handling tool calls and conversational turns.
+        Uses OpenAI function calling if available (more reliable than ReAct).
         """
         tool_descriptions = "\n".join(
             [
@@ -66,10 +74,37 @@ class ConversationOrchestrator:
                 for tool in tools
             ]
         )
-        tool_names = ", ".join([tool.name for tool in tools])
-
-        base_prompt = ChatPromptTemplate.from_messages(
-            [
+        
+        if USE_OPENAI_TOOLS and hasattr(llm, 'bind_tools'):
+            # Use OpenAI function calling for structured, reliable tool invocation
+            logger.info(f"Building agent with OpenAI function calling for {system_message_prefix}")
+            
+            prompt = ChatPromptTemplate.from_messages([
+                (
+                    "system",
+                    "You are Maria, the friendly maître d' at Bella Cucina restaurant.\n"
+                    "Today is {current_date}.\n\n"
+                    "CRITICAL: Keep ALL responses SHORT - 1-3 sentences maximum. Be conversational.\n\n"
+                    "You are a {prefix}. Use the available tools to help customers.\n"
+                    "Available tools:\n{tools}\n\n"
+                    "When you have all the information needed, provide a brief, friendly response."
+                ),
+                MessagesPlaceholder(variable_name="chat_history"),
+                ("human", "{input}"),
+                MessagesPlaceholder(variable_name="agent_scratchpad"),
+            ]).partial(
+                prefix=system_message_prefix,
+                tools=tool_descriptions,
+                current_date=datetime.now().strftime("%A, %B %d, %Y")
+            )
+            
+            agent = create_openai_tools_agent(llm, tools, prompt)
+        else:
+            # Fallback to ReAct agent
+            logger.warning(f"OpenAI tools not available, using ReAct agent for {system_message_prefix}")
+            tool_names = ", ".join([tool.name for tool in tools])
+            
+            base_prompt = ChatPromptTemplate.from_messages([
                 (
                     "system",
                     "You are Maria, the friendly maître d' at Bella Cucina restaurant.\n"
@@ -89,16 +124,34 @@ class ConversationOrchestrator:
                 ),
                 MessagesPlaceholder(variable_name="chat_history"),
                 ("human", "{input}\n{agent_scratchpad}"),
-            ]
-        ).partial(
-            prefix=system_message_prefix, 
-            tools=tool_descriptions, 
-            tool_names=tool_names,
-            current_date=datetime.now().strftime("%A, %B %d, %Y")
+            ]).partial(
+                prefix=system_message_prefix, 
+                tools=tool_descriptions, 
+                tool_names=tool_names,
+                current_date=datetime.now().strftime("%A, %B %d, %Y")
+            )
+            agent = create_react_agent(llm, tools, base_prompt)
+        
+        return AgentExecutor(
+            agent=agent, 
+            tools=tools, 
+            verbose=True, 
+            handle_parsing_errors=self._handle_tool_parsing_error
         )
-        prompt = base_prompt
-        agent = create_react_agent(llm, tools, prompt)
-        return AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
+    
+    def _handle_tool_parsing_error(self, error: Exception) -> str:
+        """
+        Custom error handler for tool parsing failures.
+        Logs the error and provides a clear fallback message.
+        """
+        logger.error(f"Tool parsing failed: {error}")
+        # Return a clear instruction for the agent to rephrase or clarify
+        return (
+            "The tool call format was invalid. Please try again with the correct format:\n"
+            "Action: [tool_name]\n"
+            "Action Input: {\"parameter\": \"value\"}\n"
+            "If you cannot determine the correct parameters, ask the user for clarification instead."
+        )
 
     def _validate_intent(self, intent_output: str) -> str:
         """
@@ -229,12 +282,38 @@ class ConversationOrchestrator:
         # (We store the full message for record, but use safe_message for processing if distinct)
         state.conversation_history.append(HumanMessage(content=user_message))
 
-        # Classify the intent of the user's message WITH conversation history for context
-        intent_category = await self.intent_classifier_chain.ainvoke({
-            "input": safe_message,
-            "chat_history": state.conversation_history[:-1]  # Exclude the just-added user message
-        })
-        state.current_intent = intent_category  # Update state with detected intent
+        # Check for intent-switching keywords that override current flow
+        lower_msg = user_message.lower()
+        intent_switch_keywords = {
+            "cancel_booking": ["cancel", "delete", "remove booking"],
+            "update_booking": ["update", "change", "modify", "postpone", "reschedule", "move"],
+            "find_booking": ["find", "look up", "check my", "my booking", "my reservation", "how many reservations"],
+        }
+        
+        force_reclassify = False
+        for intent, keywords in intent_switch_keywords.items():
+            if any(kw in lower_msg for kw in keywords):
+                force_reclassify = True
+                break
+
+        # OPTIMIZATION: Skip intent classification if already in active booking flow
+        # BUT allow re-classification if user mentions cancel/update/find keywords
+        skip_classification = (
+            not force_reclassify and
+            (state.awaiting_confirmation or 
+             (state.current_intent in ["make_booking", "check_availability"] and 
+              not state.booking_slot.is_complete_for_new_booking()))
+        )
+        
+        if not skip_classification:
+            # Classify the intent of the user's message WITH conversation history for context
+            intent_category = await self.intent_classifier_chain.ainvoke({
+                "input": safe_message,
+                "chat_history": state.conversation_history[:-1]  # Exclude the just-added user message
+            })
+            state.current_intent = intent_category  # Update state with detected intent
+        else:
+            logger.info(f"Skipping intent classification - continuing {state.current_intent} flow")
 
         logger.info(f"Detected intent: {state.current_intent}")
         
@@ -268,8 +347,15 @@ class ConversationOrchestrator:
             is_general = True
 
         # Prepare input for the chain/executor
+        # Include last_booking_id context for update/cancel operations
+        enhanced_input = user_message
+        if state.current_intent in ["update_booking", "cancel_booking"] and state.last_booking_id:
+            enhanced_input = f"{user_message} (Note: The user's most recent booking ID is {state.last_booking_id})"
+        elif state.current_intent == "find_booking" and state.caller_name:
+            enhanced_input = f"{user_message} (Note: The user's name is {state.caller_name})"
+        
         chain_input = {
-            "input": user_message,
+            "input": enhanced_input,
             "chat_history": state.conversation_history[:-1],
             "current_intent": state.current_intent,
         }
@@ -288,8 +374,9 @@ class ConversationOrchestrator:
                 else:
                     content_to_yield = "I didn't quite get that. Could you please rephrase?"
             else:
-                 if len(content_to_yield.strip()) > 5:
-                     state.confusion_count = 0
+                # Only reset confusion after 2 consecutive valid responses to avoid hair-trigger resets
+                if len(content_to_yield.strip()) > 5 and state.confusion_count > 0:
+                     state.confusion_count = max(0, state.confusion_count - 1)
             
             full_response += content_to_yield
             yield content_to_yield
