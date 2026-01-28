@@ -30,6 +30,7 @@ interface UseVoiceCallReturn {
   endCall: () => void;
   error: string | null;
   callDuration: number;
+  getAnalyserNode: () => AnalyserNode | null;
 }
 
 export function useVoiceCall(options: UseVoiceCallOptions = {}): UseVoiceCallReturn {
@@ -47,11 +48,17 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}): UseVoiceCallRet
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null); // Visualizer node
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const audioQueueRef = useRef<ArrayBuffer[]>([]);
   const isPlayingRef = useRef(false);
   const startTimeRef = useRef<number | null>(null);
   const durationIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  
+  // Expose analyser for visualization
+  const getAnalyserNode = useCallback(() => {
+    return analyserRef.current;
+  }, []);
 
   // Update status with callback
   const updateStatus = useCallback((newStatus: CallStatus) => {
@@ -98,8 +105,15 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}): UseVoiceCallRet
       
       // Play buffer
       const source = ctx.createBufferSource();
-      source.buffer = audioBuffer;
+      source.buffer = audioBuffer; // Assign buffer (missing in original code? No, createBufferSource logic was separate?)
+      
+      // FIX: Connect directly to destination for playback
       source.connect(ctx.destination);
+      
+      // FIX: Connect to analyser separately (parallel) to avoid feeding Mic into Destination via Analyser
+      if (analyserRef.current) {
+        source.connect(analyserRef.current);
+      }
       
       source.onended = () => {
         isPlayingRef.current = false;
@@ -211,10 +225,23 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}): UseVoiceCallRet
       audioContextRef.current = new AudioContext({ sampleRate: CAPTURE_SAMPLE_RATE });
       const ctx = audioContextRef.current;
       
+      // Create Analyser
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.5;
+      analyserRef.current = analyser;
+
       // Setup audio processing
       const source = ctx.createMediaStreamSource(stream);
-      const processor = ctx.createScriptProcessor(4096, 1, 1);
+      // Reduced buffer size for lower latency (2048 @ 16kHz = ~128ms)
+      const processor = ctx.createScriptProcessor(2048, 1, 1);
       processorRef.current = processor;
+      
+      // Connect Mic -> Analyser (for visualization)
+      // Connect Mic -> Processor (for sending)
+      source.connect(analyser); // Visualize mic input
+      source.connect(processor); // Send audio
+      processor.connect(ctx.destination); // Required for script processor to run
       
       // Connect WebSocket
       const wsUrl = api.getWebSocketUrl(sanitized);
@@ -294,6 +321,12 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}): UseVoiceCallRet
       durationIntervalRef.current = null;
     }
     
+    // Disconnect analyser
+    if (analyserRef.current) {
+      analyserRef.current.disconnect();
+      analyserRef.current = null;
+    }
+
     // Send end message
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'end', reason: 'user_ended' }));
@@ -355,6 +388,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}): UseVoiceCallRet
     endCall,
     error,
     callDuration,
+    getAnalyserNode,
   };
 }
 

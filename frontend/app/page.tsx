@@ -29,6 +29,7 @@ export default function HomePage() {
     endCall,
     error,
     callDuration,
+    getAnalyserNode,
   } = useVoiceCall();
 
   // Log mount
@@ -93,29 +94,31 @@ export default function HomePage() {
   const canStartCall = isReady && (status === "idle" || status === "error");
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-white flex flex-col">
-      {/* Decorative gradient orbs */}
-      <div className="fixed inset-0 overflow-hidden pointer-events-none">
-        <div className="absolute -top-40 -right-40 w-80 h-80 bg-gradient-to-br from-amber-500/20 to-orange-500/10 rounded-full blur-3xl" />
-        <div className="absolute -bottom-40 -left-40 w-80 h-80 bg-gradient-to-tr from-blue-500/10 to-purple-500/10 rounded-full blur-3xl" />
-      </div>
-
-      {/* Content */}
-      <div className="relative z-10 flex flex-col items-center justify-center flex-1 px-4 py-8 animate-fade-in">
-        {/* Header */}
-        <header className="text-center mb-8 animate-fade-in-up">
-          <h1 className="text-4xl md:text-5xl font-bold bg-gradient-to-r from-amber-400 via-orange-400 to-amber-500 bg-clip-text text-transparent mb-2">
-            Bella
-          </h1>
-          <p className="text-slate-400 text-sm md:text-base">
-            Voice Assistant for Restaurant Reservations
+    <main className="min-h-screen bg-stone-50 text-stone-900 flex flex-col items-center justify-center p-4 selection:bg-red-100 pattern-grid">
+      
+      {/* Main Container */}
+      <div className="w-full max-w-md animate-fade-in flex flex-col gap-6 relative z-10">
+        
+        {/* Header - Restaurant Branding */}
+        <header className="text-center font-serif">
+          <div className="inline-block p-1 border-b-2 border-red-600 mb-3">
+             <h1 className="text-5xl font-bold text-stone-800 tracking-tighter font-serif italic drop-shadow-sm">
+              Bella Cucina
+            </h1>
+          </div>
+          <p className="text-stone-500 text-sm font-medium tracking-widest uppercase mt-1">
+            Authentic Italian Dining
           </p>
         </header>
 
         {/* Main Card */}
-        <div className="glass-effect rounded-3xl p-6 md:p-8 w-full max-w-md animate-fade-in-up animation-delay-100">
-          {/* Status Indicator */}
-          <div className="flex justify-center mb-6">
+        <div className="bg-white rounded-[2rem] shadow-2xl shadow-stone-300/60 p-6 md:p-8 w-full border border-stone-100 animate-fade-in-up relative overflow-hidden">
+          {/* Decorative Corner accent - subtle vine/organic shape */}
+          <div className="absolute -top-12 -right-12 w-40 h-40 bg-green-50 rounded-full blur-3xl opacity-60 pointer-events-none" />
+          <div className="absolute -bottom-12 -left-12 w-40 h-40 bg-red-50 rounded-full blur-3xl opacity-60 pointer-events-none" />
+          
+          {/* Status Bar */}
+          <div className="flex items-center justify-between mb-8 relative z-10">
             <StatusIndicator
               status={status}
               duration={callDuration}
@@ -123,77 +126,96 @@ export default function HomePage() {
             />
           </div>
 
-          {/* Waveform Animation */}
-          <div className="flex justify-center mb-8">
-            <Waveform
-              isActive={isConnected}
-              isSpeaking={isSpeaking}
-              barCount={24}
-            />
+          {/* Visualization Area */}
+          <div className="h-32 mb-8 flex flex-col items-center justify-center bg-stone-50/50 rounded-xl border border-stone-100 overflow-hidden relative">
+             
+             {/* Hint when idle */}
+             {!isConnected && status !== 'error' && (
+               <div className="absolute top-4 w-full text-center z-20">
+                 <span className="text-stone-400 text-[10px] font-bold tracking-widest uppercase">
+                   Ready to connect
+                 </span>
+               </div>
+             )}
+
+             {/* Waveform Visualization */}
+             <div className="w-full h-full flex items-end justify-center pb-2">
+                <Waveform
+                  isActive={isConnected}
+                  getAnalyserNode={getAnalyserNode}
+                  barCount={20} // Fewer bars, thicker = cleaner look
+                />
+             </div>
           </div>
 
           {/* Name Input - only show when not in call */}
           {!isInCall && (
-            <div className="mb-6 animate-fade-in">
+            <div className="mb-6 animate-fade-in relative z-10">
+               <label className="block text-[10px] font-bold text-stone-400 mb-2 ml-1 uppercase tracking-widest">
+                 Your Name
+               </label>
               <NameInput
                 value={callerName}
                 onChange={handleNameChange}
                 error={nameError}
                 disabled={isInCall}
-                placeholder="Enter your name"
+                placeholder="Name for reservation..."
               />
             </div>
           )}
 
-          {/* Caller name display during call */}
+          {/* Caller display */}
           {isInCall && callerName && (
-            <div className="text-center mb-6 animate-fade-in">
-              <span className="text-slate-400 text-sm">Calling as </span>
-              <span className="text-amber-400 font-medium">{callerName}</span>
+            <div className="text-center mb-8 animate-fade-in">
+              <p className="text-stone-400 text-xs uppercase tracking-wider font-bold mb-1">Reservation For</p>
+              <p className="text-stone-800 font-serif font-bold text-xl italic">{callerName}</p>
             </div>
           )}
 
-          {/* Call Button */}
-          <div className="flex justify-center mb-6">
+          {/* Action Button */}
+          <div className="flex justify-center flex-col items-center gap-2">
             <CallButton
               status={status}
               onClick={handleCallClick}
               disabled={!canStartCall && status === "idle"}
             />
+            {status === "idle" && (
+                <span className="text-xs text-stone-400 font-medium mt-2">
+                    {canStartCall ? "Tap to Call Reservation Desk" : "Please enter name first"}
+                </span>
+            )}
           </div>
 
-          {/* Error Display */}
+          {/* Error Message */}
           {error && (
-            <div className="text-center mb-4 animate-fade-in">
-              <p className="text-red-400 text-sm bg-red-500/10 rounded-lg px-4 py-2">
+            <div className="mt-6 text-center animate-fade-in">
+              <div className="inline-flex items-center px-3 py-1.5 rounded-lg bg-red-50 text-red-700 text-sm font-medium border border-red-100">
+                <svg className="w-4 h-4 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
                 {error}
-              </p>
+              </div>
             </div>
-          )}
-
-          {/* Hint Text */}
-          {status === "idle" && (
-            <p className="text-center text-slate-500 text-xs animate-fade-in">
-              {canStartCall
-                ? "Tap the button to start your call"
-                : "Enter your name to begin"}
-            </p>
           )}
         </div>
 
-        {/* Transcript Section */}
+        {/* Live Transcript */}
         {transcripts.length > 0 && (
-          <div className="w-full max-w-md mt-6 animate-fade-in-up animation-delay-200">
+          <div className="w-full animate-fade-in-up animation-delay-200">
             <TranscriptDisplay
               transcripts={transcripts}
-              maxHeight="240px"
+              maxHeight="200px"
             />
           </div>
         )}
 
-        {/* Footer */}
-        <footer className="mt-8 text-center text-slate-600 text-xs animate-fade-in animation-delay-300">
-          <p>Powered by AI Voice Technology</p>
+        <footer className="text-center mt-4">
+            <p className="text-stone-400 text-xs font-semibold uppercase tracking-widest mb-1">
+                Voice Technology by
+            </p>
+            <p className="text-stone-600 font-bold text-sm">
+                Synthion AI
+            </p>
         </footer>
       </div>
     </main>

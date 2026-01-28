@@ -37,11 +37,10 @@ export function CallButton({ status, onClick, disabled }: CallButtonProps) {
           relative z-10 w-20 h-20 rounded-full flex items-center justify-center
           transition-all duration-300 transform
           ${isActive 
-            ? 'bg-gradient-to-br from-red-500 to-red-600 hover:from-red-600 hover:to-red-700 scale-110' 
-            : 'bg-gradient-to-br from-indigo-500 to-indigo-600 hover:from-indigo-600 hover:to-indigo-700'
+            ? 'bg-rose-500 hover:bg-rose-600 shadow-xl shadow-rose-200 ring-4 ring-rose-100' // Elegant Rose for End
+            : 'bg-emerald-600 hover:bg-emerald-700 shadow-xl shadow-emerald-200 ring-4 ring-emerald-100' // Elegant Emerald for Start
           }
-          ${disabled || isConnecting ? 'opacity-50 cursor-not-allowed' : 'hover:scale-105 active:scale-95'}
-          shadow-2xl
+          ${disabled || isConnecting ? 'opacity-50 cursor-not-allowed grayscale' : 'hover:-translate-y-1 active:scale-95'}
         `}
         aria-label={isActive ? 'End call' : 'Start call'}
       >

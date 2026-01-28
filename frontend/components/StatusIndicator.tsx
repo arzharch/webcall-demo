@@ -52,16 +52,16 @@ export function StatusIndicator({ status, duration, sessionId, className = '' }:
       {/* Status text */}
       <div className="flex flex-col">
         <span className={`text-sm font-medium ${
-          status === 'error' ? 'text-red-400' : 
-          isActive ? 'text-green-400' : 
-          'text-slate-400'
+          status === 'error' ? 'text-red-500' : 
+          isActive ? 'text-emerald-600' : 
+          'text-slate-500'
         }`}>
           {config.label}
         </span>
         
         {/* Duration */}
         {isActive && duration !== undefined && (
-          <span className="text-xs text-slate-500 font-mono">
+          <span className="text-xs text-slate-400 font-mono">
             {formatDuration(duration)}
           </span>
         )}
