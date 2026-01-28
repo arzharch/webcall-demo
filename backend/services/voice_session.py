@@ -1,281 +1,601 @@
+"""
+Voice Session Manager for WebSocket-based voice calls.
+Handles the full lifecycle of a voice call session.
+"""
 import asyncio
-import secrets
+import hashlib
+import logging
 import time
-from dataclasses import dataclass
-from fractions import Fraction
-from typing import Any, Dict, Optional
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Optional, Deque, Any
 
-from aiortc import RTCPeerConnection, RTCSessionDescription
-from aiortc.exceptions import InvalidStateError
-from aiortc.mediastreams import MediaStreamTrack
-from av import AudioFrame
-from backend.agent.agent import BellaAgent
-from backend.agent.state import SessionState
-from backend.config import Settings, get_settings
-from backend.database import Database, get_database
-from backend.services.cost_tracker import CostTracker
-from backend.services.restaurant import get_restaurant_template
-from backend.services.stt_service import DeepgramSTTService
-from backend.services.tts_service import GoogleTTSService
-from backend.services.vad import SpeechGate
+from fastapi import WebSocket
+
+from agent.agent import BellaAgent
+from agent.state import SessionState
+from services.stt_service import STTService
+from services.tts_service import TTSService, TTSStreamProcessor
+from infra import (
+    CircuitBreakerManager,
+    CircuitState,
+    ConcurrencyLimiter,
+    trace_span,
+    track_llm_cost,
+)
+from infra.config import config
+import database as db
+
+logger = logging.getLogger(__name__)
 
 
-class TTSAudioTrack(MediaStreamTrack):
-    kind = "audio"
-
-    def __init__(self, sample_rate: int) -> None:
-        super().__init__()
-        self.sample_rate = sample_rate
-        self._queue: asyncio.Queue[AudioFrame] = asyncio.Queue()
-        self._closed = False
-
-    async def recv(self) -> AudioFrame:
-        if self._closed:
-            raise InvalidStateError("Audio track closed")
-        frame = await self._queue.get()
-        return frame
-
-    async def enqueue_pcm(self, pcm_bytes: bytes) -> None:
-        if not pcm_bytes or self._closed:
-            return
-        frame_bytes = int(self.sample_rate * 20 / 1000) * 2  # 20 ms
-        for chunk in _chunk_bytes(pcm_bytes, frame_bytes):
-            samples = max(1, len(chunk) // 2)
-            frame = AudioFrame(format="s16", layout="mono", samples=samples)
-            frame.planes[0].update(chunk)
-            frame.sample_rate = self.sample_rate
-            frame.time_base = Fraction(1, self.sample_rate)
-            await self._queue.put(frame)
-
-    async def close(self) -> None:
-        self._closed = True
-        while not self._queue.empty():
-            try:
-                self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+class CallStatus(str, Enum):
+    """Voice call status."""
+    CONNECTING = "connecting"
+    ACTIVE = "active"
+    PROCESSING = "processing"  # Agent is thinking
+    SPEAKING = "speaking"      # TTS playing
+    PAUSED = "paused"
+    ENDED = "ended"
+    ERROR = "error"
 
 
 @dataclass
-class VoiceCallSession:
-    session_id: str
-    caller_name: str
-    settings: Settings
-    database: Database
-    agent: BellaAgent
-    cost_tracker: CostTracker
-    stt_service: DeepgramSTTService
-    tts_service: GoogleTTSService
-    vad: SpeechGate
+class VoiceSessionMetrics:
+    """Metrics tracked during a voice session."""
+    turn_count: int = 0
+    interruption_count: int = 0
+    error_count: int = 0
+    total_tts_ms: int = 0
+    total_stt_ms: int = 0
+    total_llm_ms: int = 0
+    response_latencies: list = field(default_factory=list)
+    
+    def avg_latency_ms(self) -> float:
+        if not self.response_latencies:
+            return 0.0
+        return sum(self.response_latencies) / len(self.response_latencies)
 
-    peer_connection: Optional[RTCPeerConnection] = None
-    tts_track: Optional[TTSAudioTrack] = None
-    session_state: SessionState = None
-    _tasks: list = None
 
-    def __post_init__(self) -> None:
-        self.session_state = SessionState(
-            session_id=self.session_id, caller_name=self.caller_name
+class VoiceSession:
+    """
+    Manages a single voice call session over WebSocket.
+    
+    Responsibilities:
+    - Receive audio from browser via WebSocket
+    - Send audio to Deepgram for STT
+    - Process transcripts through agent
+    - Stream TTS audio back to browser
+    - Handle interruptions (barge-in)
+    - Track metrics and persist to database
+    """
+    
+    # Buffer settings
+    DEBOUNCE_DELAY = 1.0  # Seconds to wait for continuation
+    MAX_BUFFER_SIZE = 10  # Max transcript chunks before force processing
+    MAX_ACCUMULATION_TIME = 8.0  # Max seconds to accumulate
+    
+    def __init__(
+        self,
+        websocket: WebSocket,
+        caller_name: str,
+        session_id: Optional[str] = None,
+        phone_number: Optional[str] = None,
+    ):
+        """
+        Initialize a voice session.
+        
+        Args:
+            websocket: FastAPI WebSocket connection
+            caller_name: Name of the caller
+            session_id: Optional session ID (generated if not provided)
+            phone_number: Optional phone number for analytics
+        """
+        self.websocket = websocket
+        self.caller_name = caller_name
+        self.session_id = session_id or str(uuid.uuid4())
+        self.phone_number = phone_number
+        
+        # Status
+        self.status = CallStatus.CONNECTING
+        self.started_at = time.time()
+        self.ended_at: Optional[float] = None
+        
+        # Agent
+        self.agent_state = SessionState(caller_name=caller_name)
+        self.agent = BellaAgent(self.agent_state)
+        
+        # Services (initialized in start())
+        self.stt: Optional[STTService] = None
+        self.tts: Optional[TTSService] = None
+        self.tts_processor: Optional[TTSStreamProcessor] = None
+        
+        # Infrastructure
+        self.circuit_breakers = CircuitBreakerManager()
+        self.concurrency_limiter = ConcurrencyLimiter(
+            "voice_calls", 
+            config.concurrency.max_concurrent_llm_calls
         )
-        self._tasks = []
-
-    async def attach_peer_connection(self, offer: Dict[str, str]) -> Dict[str, str]:
-        if self.peer_connection:
-            await self.peer_connection.close()
-
-        pc = RTCPeerConnection()
-        self.peer_connection = pc
-        self.tts_track = TTSAudioTrack(self.settings.SAMPLE_RATE)
-        pc.addTrack(self.tts_track)
-
-        @pc.on("track")
-        async def on_track(track: MediaStreamTrack) -> None:
-            if track.kind == "audio":
-                task = asyncio.create_task(self._consume_audio(track))
-                self._tasks.append(task)
-
-        @pc.on("connectionstatechange")
-        async def on_state_change() -> None:
-            if pc.connectionState in {"failed", "closed"}:
-                await self.shutdown(status="terminated")
-
-        rtc_offer = RTCSessionDescription(sdp=offer["sdp"], type=offer.get("type", "offer"))
-        await pc.setRemoteDescription(rtc_offer)
-        answer = await pc.createAnswer()
-        await pc.setLocalDescription(answer)
-        return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
-
-    async def _consume_audio(self, track: MediaStreamTrack) -> None:
+        
+        # Transcript buffering (for debounce)
+        self._input_buffer: list[str] = []
+        self._buffer_start_time: Optional[float] = None
+        self._debounce_task: Optional[asyncio.Task] = None
+        self._agent_task: Optional[asyncio.Task] = None
+        self._current_processing_text: Optional[str] = None
+        
+        # Response loop detection
+        self._response_history: Deque[str] = deque(maxlen=3)
+        
+        # Metrics
+        self.metrics = VoiceSessionMetrics()
+        
+        # State flags
+        self._is_speaking = False
+        self._stop_playback = False
+        
+        logger.info(f"VoiceSession created: {self.session_id} for {caller_name}")
+        
+    async def start(self):
+        """
+        Initialize and start the voice session.
+        Call after WebSocket connection is established.
+        """
         try:
-            while True:
-                frame = await track.recv()
-                pcm = frame.to_ndarray(format="s16", layout="mono")
-                pcm_bytes = pcm.tobytes()
-                frame_duration = len(pcm_bytes) / (2 * self.settings.SAMPLE_RATE)
-                self.cost_tracker.add_stt_seconds(frame_duration)
-                for chunk in _chunk_bytes(pcm_bytes, self.vad.frame_bytes):
-                    if len(chunk) != self.vad.frame_bytes:
-                        continue
-                    voiced = self.vad.process(chunk)
-                    if voiced:
-                        transcript = await self.stt_service.transcribe_pcm(voiced)
-                        if transcript:
-                            await self._handle_transcript(transcript)
-        except asyncio.CancelledError:
+            # Create database record
+            db.create_call(
+                call_id=self.session_id,
+                caller_name=self.caller_name,
+                phone_number=self.phone_number
+            )
+            
+            # Initialize TTS
+            self.tts = TTSService(
+                circuit_breakers=self.circuit_breakers
+            )
+            self.tts.preload_filler_audio()
+            self.tts_processor = TTSStreamProcessor(self.tts)
+            
+            # Initialize STT
+            self.stt = STTService(
+                on_speech_start=self._on_speech_start,
+                on_final_transcript=self._on_transcript,
+            )
+            
+            # Connect to Deepgram
+            connected = await self.stt.connect()
+            if not connected:
+                self.status = CallStatus.ERROR
+                await self._send_status("error", "Failed to connect to speech service")
+                return False
+            
+            self.status = CallStatus.ACTIVE
+            await self._send_status("connected", "Voice session ready")
+            
+            # Send greeting
+            await self._speak("Hello! Welcome to Bella Cucina. How may I help you today?")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to start session {self.session_id}: {e}")
+            self.status = CallStatus.ERROR
+            return False
+    
+    async def handle_audio(self, audio_data: bytes):
+        """
+        Handle incoming audio from browser.
+        
+        Args:
+            audio_data: Raw audio bytes (LINEAR16, 16kHz, mono)
+        """
+        if self.status not in (CallStatus.ACTIVE, CallStatus.PROCESSING, CallStatus.SPEAKING):
             return
-        except Exception:
-            await self.shutdown(status="error")
-
-    async def _handle_transcript(self, user_text: str) -> None:
-        await self.database.record_message(self.session_id, "user", user_text)
-
-        ai_response = ""
-        async for chunk in self.agent.process_message(self.session_state, user_text):
-            ai_response = chunk
-
-        if not ai_response:
-            ai_response = "I did not catch that. Could you repeat?"
-
-        self.session_state.update_history(user_text, ai_response)
-        await self.database.record_message(self.session_id, "assistant", ai_response)
-
-        # naive token estimate: 1 token per 4 chars
-        est_prompt_tokens = max(1, len(user_text) // 4)
-        est_completion_tokens = max(1, len(ai_response) // 4)
-        self.cost_tracker.add_llm_usage(est_prompt_tokens, est_completion_tokens)
-
-        audio_bytes = await self.tts_service.synthesize(ai_response)
-        if audio_bytes and self.tts_track:
-            await self.tts_track.enqueue_pcm(audio_bytes)
-
-    async def shutdown(self, status: str = "completed") -> None:
-        for task in self._tasks:
-            task.cancel()
-        self._tasks.clear()
-        if self.peer_connection:
-            await self.peer_connection.close()
-            self.peer_connection = None
-        if self.tts_track:
-            await self.tts_track.close()
-            self.tts_track = None
-        snapshot = self.cost_tracker.snapshot()
-        last_ai_message = None
-        for entry in reversed(self.session_state.conversation_history):
-            if entry.startswith("AI:"):
-                last_ai_message = entry.replace("AI:", "").strip()
-                break
-        await self.database.close_call_session(
-            session_id=self.session_id,
-            status=status,
-            last_agent_message=last_ai_message,
-            cost_snapshot=snapshot,
+        
+        if self.stt and self.stt.is_connected:
+            await self.stt.send_audio(audio_data)
+    
+    async def end(self, reason: str = "user_ended"):
+        """
+        End the voice session gracefully.
+        
+        Args:
+            reason: Reason for ending (user_ended, transferred, error, timeout)
+        """
+        self.status = CallStatus.ENDED
+        self.ended_at = time.time()
+        
+        # Cancel any pending tasks
+        if self._debounce_task and not self._debounce_task.done():
+            self._debounce_task.cancel()
+        if self._agent_task and not self._agent_task.done():
+            self._agent_task.cancel()
+        
+        # Disconnect STT
+        if self.stt:
+            await self.stt.disconnect()
+        
+        # Save call analytics to database
+        try:
+            result = db.end_call(
+                call_id=self.session_id,
+                end_reason=reason,
+                turn_count=self.metrics.turn_count,
+                interruption_count=self.metrics.interruption_count,
+                error_count=self.metrics.error_count,
+                total_tts_ms=self.metrics.total_tts_ms,
+                total_stt_ms=self.metrics.total_stt_ms,
+                total_llm_ms=self.metrics.total_llm_ms,
+            )
+            logger.info(f"Session {self.session_id} ended: {result}")
+        except Exception as e:
+            logger.error(f"Failed to save call analytics: {e}")
+        
+        await self._send_status("ended", reason)
+    
+    # ==================== STT Callbacks ====================
+    
+    def _on_speech_start(self):
+        """Called when VAD detects speech started (barge-in)."""
+        if not self._is_speaking:
+            return
+        
+        logger.info(f"[{self.session_id}] Interruption detected")
+        self.metrics.interruption_count += 1
+        
+        # Stop current playback
+        self._stop_playback = True
+        
+        # Cancel agent task if running
+        if self._agent_task and not self._agent_task.done():
+            self._agent_task.cancel()
+            
+            # Rescue context - keep current processing text in buffer
+            if self._current_processing_text:
+                self._input_buffer.insert(0, self._current_processing_text)
+                self._current_processing_text = None
+        
+        # Cancel debounce timer
+        if self._debounce_task and not self._debounce_task.done():
+            self._debounce_task.cancel()
+    
+    def _on_transcript(self, text: str):
+        """Called when final transcript is received."""
+        if not text.strip():
+            return
+        
+        # Schedule processing in the event loop
+        asyncio.create_task(self._handle_transcript(text))
+    
+    async def _handle_transcript(self, text: str):
+        """Process a transcript segment."""
+        # Track buffer start time
+        if not self._input_buffer:
+            self._buffer_start_time = time.time()
+        
+        self._input_buffer.append(text)
+        
+        # Check if we should force processing
+        should_force = (
+            len(self._input_buffer) >= self.MAX_BUFFER_SIZE or
+            (self._buffer_start_time and 
+             time.time() - self._buffer_start_time > self.MAX_ACCUMULATION_TIME)
         )
+        
+        if should_force:
+            logger.debug(f"Force processing buffer (size: {len(self._input_buffer)})")
+            if self._debounce_task:
+                self._debounce_task.cancel()
+            await self._process_buffer()
+            return
+        
+        # Reschedule debounce
+        if self._debounce_task and not self._debounce_task.done():
+            self._debounce_task.cancel()
+        
+        self._debounce_task = asyncio.create_task(self._debounce_and_process())
+    
+    async def _debounce_and_process(self):
+        """Wait for debounce delay then process buffer."""
+        try:
+            await asyncio.sleep(self.DEBOUNCE_DELAY)
+            await self._process_buffer()
+        except asyncio.CancelledError:
+            pass
+    
+    async def _process_buffer(self):
+        """Process accumulated transcript buffer."""
+        if not self._input_buffer:
+            return
+        
+        # Stop any current playback
+        self._stop_playback = True
+        
+        full_text = " ".join(self._input_buffer)
+        self._input_buffer = []
+        self._buffer_start_time = None
+        
+        # Send user message to frontend
+        await self._send_message("user", full_text)
+        
+        # Save to database
+        db.add_transcript(
+            call_id=self.session_id,
+            turn_number=self.metrics.turn_count,
+            role="user",
+            content=full_text,
+        )
+        
+        # Store for potential rescue on interruption
+        self._current_processing_text = full_text
+        
+        # Process through agent
+        self._agent_task = asyncio.create_task(self._run_agent(full_text))
+    
+    async def _run_agent(self, text: str):
+        """Process user input through the agent."""
+        turn_start = time.time()
+        self.status = CallStatus.PROCESSING
+        self.metrics.turn_count += 1
+        
+        try:
+            async with self.concurrency_limiter:
+                # Check LLM circuit breaker
+                llm_breaker = self.circuit_breakers.get_breaker("llm")
+                if llm_breaker.state == CircuitState.OPEN:
+                    logger.error("LLM circuit breaker OPEN")
+                    self.metrics.error_count += 1
+                    await self._speak("I'm having trouble connecting. Please try again in a moment.")
+                    return
+                
+                full_response = ""
+                current_sentence = ""
+                
+                llm_start = time.time()
+                
+                with trace_span("llm_agent_call", {"input_length": len(text)}) as span:
+                    try:
+                        async for chunk in self.agent.orchestrator.process_message(
+                            self.agent.state, text
+                        ):
+                            # Handle error tokens
+                            if "Invalid Format" in str(chunk) or "Exception" in str(chunk):
+                                logger.warning(f"Suppressed error: {chunk}")
+                                continue
+                            
+                            current_sentence += chunk
+                            
+                            # Check for sentence completion
+                            if any(p in chunk for p in ['.', '?', '!']):
+                                sentence = current_sentence.strip()
+                                if sentence:
+                                    # Loop detection
+                                    response_hash = hashlib.md5(sentence.encode()).hexdigest()
+                                    if list(self._response_history).count(response_hash) >= 2:
+                                        logger.error("Loop detected - transferring")
+                                        await self._speak(
+                                            "I apologize, I seem to be having trouble. "
+                                            "Let me transfer you to someone who can help."
+                                        )
+                                        await self.end("transferred")
+                                        return
+                                    
+                                    self._response_history.append(response_hash)
+                                    
+                                    # Speak sentence immediately
+                                    await self._speak(sentence)
+                                    full_response += sentence + " "
+                                    
+                                current_sentence = ""
+                        
+                        # Flush remaining
+                        if current_sentence.strip():
+                            await self._speak(current_sentence)
+                            full_response += current_sentence
+                        
+                        llm_breaker.record_success()
+                        
+                    except asyncio.TimeoutError:
+                        logger.error("LLM timeout")
+                        llm_breaker.record_failure()
+                        self.metrics.error_count += 1
+                        await self._speak("I'm taking too long. Could you repeat that?")
+                        return
+                    except Exception as e:
+                        logger.error(f"LLM error: {e}")
+                        llm_breaker.record_failure()
+                        self.metrics.error_count += 1
+                        raise
+                    
+                    llm_ms = int((time.time() - llm_start) * 1000)
+                    self.metrics.total_llm_ms += llm_ms
+                    span.set_attribute("duration_ms", llm_ms)
+                    
+                    track_llm_cost(
+                        session_id=self.session_id,
+                        model="gpt-3.5-turbo",
+                        operation="agent_response",
+                        input_messages=[{"content": text}],
+                        output_text=full_response,
+                        duration_ms=llm_ms,
+                    )
+                
+                # Clear processing text on success
+                self._current_processing_text = None
+                
+                final_response = full_response.strip()
+                if not final_response:
+                    final_response = "I'm sorry, I didn't catch that. Could you repeat?"
+                    await self._speak(final_response)
+                
+                # Save assistant response
+                latency_ms = int((time.time() - turn_start) * 1000)
+                self.metrics.response_latencies.append(latency_ms)
+                
+                db.add_transcript(
+                    call_id=self.session_id,
+                    turn_number=self.metrics.turn_count,
+                    role="assistant",
+                    content=final_response,
+                    latency_ms=latency_ms,
+                )
+                
+                await self._send_message("assistant", final_response)
+                
+                logger.info(f"Turn {self.metrics.turn_count} complete: {latency_ms}ms")
+                
+        except asyncio.CancelledError:
+            logger.info("Agent task cancelled (interrupted)")
+        except Exception as e:
+            logger.error(f"Agent error: {e}")
+            self.metrics.error_count += 1
+        finally:
+            self.status = CallStatus.ACTIVE
+    
+    async def _speak(self, text: str):
+        """Synthesize and send TTS audio."""
+        if not text.strip():
+            return
+        
+        self._stop_playback = False
+        self.status = CallStatus.SPEAKING
+        self._is_speaking = True
+        
+        try:
+            tts_start = time.time()
+            audio = await self.tts.synthesize(text)
+            tts_ms = int((time.time() - tts_start) * 1000)
+            self.metrics.total_tts_ms += tts_ms
+            
+            if audio and not self._stop_playback:
+                await self._send_audio(audio)
+                
+        except Exception as e:
+            logger.error(f"TTS error: {e}")
+        finally:
+            self._is_speaking = False
+            if self.status == CallStatus.SPEAKING:
+                self.status = CallStatus.ACTIVE
+    
+    # ==================== WebSocket Helpers ====================
+    
+    async def _send_audio(self, audio_data: bytes):
+        """Send audio data to browser via WebSocket."""
+        try:
+            await self.websocket.send_bytes(audio_data)
+        except Exception as e:
+            logger.error(f"Failed to send audio: {e}")
+    
+    async def _send_message(self, role: str, content: str):
+        """Send a transcript message to browser."""
+        try:
+            await self.websocket.send_json({
+                "type": "transcript",
+                "role": role,
+                "content": content,
+                "timestamp": time.time(),
+            })
+        except Exception as e:
+            logger.error(f"Failed to send message: {e}")
+    
+    async def _send_status(self, status: str, message: str = ""):
+        """Send status update to browser."""
+        try:
+            await self.websocket.send_json({
+                "type": "status",
+                "status": status,
+                "message": message,
+                "session_id": self.session_id,
+            })
+        except Exception as e:
+            logger.error(f"Failed to send status: {e}")
 
 
-class VoiceCallManager:
-    """Orchestrates lifecycle of low-latency voice sessions."""
-
-    def __init__(self, settings: Settings | None = None) -> None:
-        self.settings = settings or get_settings()
-        self.database = get_database()
-        self.template = get_restaurant_template()
-        self.sessions: Dict[str, VoiceCallSession] = {}
+class VoiceSessionManager:
+    """
+    Manages multiple concurrent voice sessions.
+    Provides session lookup and cleanup.
+    """
+    
+    def __init__(self, max_sessions: int = 100):
+        self.max_sessions = max_sessions
+        self._sessions: dict[str, VoiceSession] = {}
         self._lock = asyncio.Lock()
-        self._ready = False
-
-    async def startup(self) -> None:
-        await self.database.init()
-        self._ready = True
-
-    async def create_session(self, caller_name: str) -> Dict[str, Any]:
-        if not self._ready:
-            await self.startup()
-        session_id = secrets.token_hex(8)
-        signaling_token = secrets.token_urlsafe(24)
-        expires_at = int(time.time()) + self.settings.SIGNALING_TOKEN_TTL_SECONDS
-
-        agent = BellaAgent(google_api_key=self.settings.GOOGLE_API_KEY)
-        cost_tracker = CostTracker(self.settings)
-        stt_service = DeepgramSTTService(self.settings)
-        tts_service = GoogleTTSService(self.settings, cost_tracker=cost_tracker)
-        vad = SpeechGate(
-            sample_rate=self.settings.SAMPLE_RATE,
-            aggressiveness=self.settings.VAD_AGGRESSIVENESS,
-            frame_ms=self.settings.VAD_FRAME_MS,
-            padding_ms=self.settings.VAD_END_WINDOW_MS,
-        )
-
-        session = VoiceCallSession(
-            session_id=session_id,
-            caller_name=caller_name,
-            settings=self.settings,
-            database=self.database,
-            agent=agent,
-            cost_tracker=cost_tracker,
-            stt_service=stt_service,
-            tts_service=tts_service,
-            vad=vad,
-        )
-
+        
+    async def create_session(
+        self,
+        websocket: WebSocket,
+        caller_name: str,
+        phone_number: Optional[str] = None,
+    ) -> VoiceSession:
+        """Create and register a new voice session."""
         async with self._lock:
-            self.sessions[session_id] = session
-
-        await self.database.create_call_session(
-            session_id=session_id,
-            caller_name=caller_name,
-            signaling_token=signaling_token,
-            token_expires_at=expires_at,
+            if len(self._sessions) >= self.max_sessions:
+                # Clean up ended sessions
+                await self._cleanup_ended()
+                
+                if len(self._sessions) >= self.max_sessions:
+                    raise RuntimeError("Maximum concurrent sessions reached")
+            
+            session = VoiceSession(
+                websocket=websocket,
+                caller_name=caller_name,
+                phone_number=phone_number,
+            )
+            self._sessions[session.session_id] = session
+            return session
+    
+    def get_session(self, session_id: str) -> Optional[VoiceSession]:
+        """Get a session by ID."""
+        return self._sessions.get(session_id)
+    
+    async def end_session(self, session_id: str, reason: str = "user_ended"):
+        """End and remove a session."""
+        async with self._lock:
+            session = self._sessions.pop(session_id, None)
+            if session:
+                await session.end(reason)
+    
+    async def _cleanup_ended(self):
+        """Remove ended sessions from the registry."""
+        ended_ids = [
+            sid for sid, session in self._sessions.items()
+            if session.status == CallStatus.ENDED
+        ]
+        for sid in ended_ids:
+            del self._sessions[sid]
+    
+    @property
+    def active_session_count(self) -> int:
+        """Number of active sessions."""
+        return sum(
+            1 for s in self._sessions.values()
+            if s.status not in (CallStatus.ENDED, CallStatus.ERROR)
         )
-
-        return {
-            "session_id": session_id,
-            "signaling_token": signaling_token,
-            "token_expires_at": expires_at,
-        }
-
-    async def handle_offer(
-        self, session_id: str, signaling_token: str, offer: Dict[str, str]
-    ) -> Dict[str, str]:
-        if not self._ready:
-            await self.startup()
-        valid = await self.database.verify_signaling_token(session_id, signaling_token)
-        if not valid:
-            raise PermissionError("Invalid or expired signaling token")
-
-        session = self.sessions.get(session_id)
-        if not session:
-            raise ValueError("Session not found")
-
-        return await session.attach_peer_connection(offer)
-
-    async def ingest_text(self, session_id: str, text: str) -> str:
-        if not self._ready:
-            await self.startup()
-        session = self.sessions.get(session_id)
-        if not session:
-            raise ValueError("Session not found")
-        await session._handle_transcript(text)
-        for entry in reversed(session.session_state.conversation_history):
-            if entry.startswith("AI:"):
-                return entry.replace("AI:", "").strip()
-        return ""
-
-    async def end_session(self, session_id: str, status: str = "completed") -> None:
-        session = self.sessions.pop(session_id, None)
-        if session:
-            await session.shutdown(status=status)
+    
+    def get_all_sessions(self) -> list[dict]:
+        """Get summary of all sessions."""
+        return [
+            {
+                "session_id": s.session_id,
+                "caller_name": s.caller_name,
+                "status": s.status.value,
+                "turn_count": s.metrics.turn_count,
+                "duration": time.time() - s.started_at,
+            }
+            for s in self._sessions.values()
+        ]
 
 
-_manager: Optional[VoiceCallManager] = None
+# Global session manager instance
+_session_manager: Optional[VoiceSessionManager] = None
 
 
-def get_voice_manager() -> VoiceCallManager:
-    global _manager
-    if _manager is None:
-        _manager = VoiceCallManager()
-    return _manager
-
-
-def _chunk_bytes(data: bytes, frame_bytes: int):
-    for idx in range(0, len(data), frame_bytes):
-        yield data[idx : idx + frame_bytes]
+def get_voice_session_manager() -> VoiceSessionManager:
+    """Get the global voice session manager."""
+    global _session_manager
+    if _session_manager is None:
+        _session_manager = VoiceSessionManager()
+    return _session_manager

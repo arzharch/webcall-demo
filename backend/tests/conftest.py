@@ -113,11 +113,3 @@ def mock_openai():
         mock_instance = MagicMock()
         mock.return_value = mock_instance
         yield mock_instance
-    
-    db = Database(str(test_db_path))
-    db.initialize()
-    yield db
-    
-    # Cleanup
-    if test_db_path.exists():
-        test_db_path.unlink()
