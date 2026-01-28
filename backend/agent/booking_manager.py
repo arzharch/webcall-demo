@@ -238,18 +238,20 @@ class BookingManager:
         """Generate a natural success/confirmation message, addressing any side questions."""
         system_prompt = (
             "You are Bella, a professional restaurant hostess.\n"
-            "We have all the necessary booking details and found a table.\n"
-            f"Booking: Table for {slot.party_size} on {slot.date} at {slot.time} under {slot.name}.\n"
+            "We have all the details needed to make a reservation.\n"
+            f"Requested Booking: Table for {slot.party_size} on {slot.date} at {slot.time} under the name {slot.name}.\n"
             f"User's Last Message: \"{user_message}\"\n\n"
-            "TASK: Ask the user to CONFIRM the booking details.\n"
+            "TASK: Ask the user to CONFIRM they want to proceed with this booking.\n"
             "CRITICAL RULES:\n"
-            "1. SIDE QUESTIONS: If the user asked a question in their last message (e.g. 'parking?', 'vegan?'), ANSWER IT FIRST.\n"
-            "2. CONFIRMATION: Then, state the booking details clearly and ask 'Shall I confirm?'\n"
-            "3. STYLE: Conversational, warm, short."
+            "1. DO NOT say 'we have booked' or 'reservation confirmed' - IT IS NOT YET CONFIRMED.\n"
+            "2. Present the details and ask 'Shall I confirm this booking?' or 'Would you like me to book this?'\n"
+            "3. SIDE QUESTIONS: If the user asked a question in their last message (e.g. 'parking?', 'vegan?'), ANSWER IT FIRST briefly.\n"
+            "4. STYLE: Conversational, warm, short (1-2 sentences).\n"
+            "5. Example: 'I have a table for 4 on Friday at 7 PM under John. Shall I confirm?'"
         )
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
-            ("human", "Generate the confirmation response.")
+            ("human", "Generate the confirmation request.")
         ])
         chain = prompt | self.llm
         response = await chain.ainvoke({})
@@ -263,6 +265,24 @@ class BookingManager:
         # ... (rest of the method logic) ...
         # 1. Check if user is answering a confirmation request
         # We do this BEFORE extraction to avoid confusing "yes" with data
+        
+        # PRE-CHECK: Detect closing/thank you messages - these should end the flow gracefully
+        lower_msg = user_message.lower().strip()
+        closing_phrases = ["thank you", "thanks", "bye", "goodbye", "that's all", "thats all", 
+                          "ok thanks", "okay thanks", "thank", "perfect thanks", "great thanks",
+                          "awesome thanks", "sounds good thanks", "cheers"]
+        
+        if any(phrase in lower_msg for phrase in closing_phrases) and not self._is_rejection(user_message):
+            # User is saying thank you / closing - respond gracefully and reset
+            state.awaiting_confirmation = False
+            state.booking_slot = BookingSlot()  # Clear booking state
+            state.current_intent = "general_query"  # Reset intent
+            
+            # Generate warm closing
+            if state.last_booking_id:
+                return "You're welcome! We look forward to seeing you. Have a great day!"
+            else:
+                return "You're welcome! Let me know if you need anything else."
         
         # PRE-CHECK: Apply caller name if available and not "Guest" (Case insensitive)
         # This ensures we don't ask for name if we already know who called.
