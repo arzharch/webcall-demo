@@ -16,8 +16,9 @@ from fastapi import WebSocket
 
 from agent.agent import BellaAgent
 from agent.state import SessionState
-from services.stt_service import STTService
+from services.google_stt_service import STTFallbackService
 from services.tts_service import TTSService, TTSStreamProcessor
+from services.system_audio import get_system_audio
 from infra import (
     CircuitBreakerManager,
     CircuitState,
@@ -108,7 +109,7 @@ class VoiceSession:
         self.agent = BellaAgent(self.agent_state)
         
         # Services (initialized in start())
-        self.stt: Optional[STTService] = None
+        self.stt: Optional[STTFallbackService] = None
         self.tts: Optional[TTSService] = None
         self.tts_processor: Optional[TTSStreamProcessor] = None
         
@@ -142,6 +143,8 @@ class VoiceSession:
         """
         Initialize and start the voice session.
         Call after WebSocket connection is established.
+        
+        Plays connecting audio while setting up STT with fallback.
         """
         try:
             # Create database record
@@ -151,28 +154,45 @@ class VoiceSession:
                 phone_number=self.phone_number
             )
             
-            # Initialize TTS
+            # Initialize TTS first (needed for audio feedback)
             self.tts = TTSService(
                 circuit_breakers=self.circuit_breakers
             )
             self.tts.preload_filler_audio()
             self.tts_processor = TTSStreamProcessor(self.tts)
             
-            # Initialize STT
-            self.stt = STTService(
+            # Get system audio service
+            system_audio = get_system_audio()
+            
+            # Send connecting audio (ringing) to keep user engaged
+            connecting_audio = system_audio.get_ringing_audio()
+            if connecting_audio:
+                logger.info("Playing connecting audio...")
+                await self._send_audio(connecting_audio)
+            
+            # Initialize STT with fallback (Deepgram -> Google Cloud)
+            self.stt = STTFallbackService(
                 on_speech_start=self._on_speech_start,
                 on_final_transcript=self._on_transcript,
             )
             
-            # Connect to Deepgram
-            connected = await self.stt.connect()
+            # Connect to STT (tries Deepgram first, then Google)
+            connected, provider = await self.stt.connect()
             if not connected:
                 self.status = CallStatus.ERROR
+                
+                # Play error audio
+                error_audio = system_audio.get_connection_error_audio()
+                if error_audio:
+                    await self._send_audio(error_audio)
+                
                 await self._send_status("error", "Failed to connect to speech service")
                 return False
             
+            logger.info(f"STT connected using: {provider}")
+            
             self.status = CallStatus.ACTIVE
-            await self._send_status("connected", "Voice session ready")
+            await self._send_status("connected", f"Voice session ready (STT: {provider})")
             
             # Send greeting
             await self._speak("Hello! Welcome to Bella Cucina. How may I help you today?")

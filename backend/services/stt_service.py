@@ -50,46 +50,64 @@ class STTService:
         self._connection = None
         self._is_connected = False
         
-    async def connect(self) -> bool:
+    async def connect(self, max_retries: int = 3) -> bool:
         """
-        Establish connection to Deepgram.
+        Establish connection to Deepgram with retry logic.
         Returns True if successful.
         """
-        try:
-            config = DeepgramClientOptions(options={"keepalive": "true"})
-            self._client = DeepgramClient(settings.DEEPGRAM_API_KEY, config)
-            self._connection = self._client.listen.asynclive.v("1")
-            
-            # Set up event handlers
-            self._connection.on(LiveTranscriptionEvents.Transcript, self._on_message)
-            self._connection.on(LiveTranscriptionEvents.SpeechStarted, self._on_speech_started)
-            self._connection.on(LiveTranscriptionEvents.Error, self._on_error)
-            
-            # Configure live options
-            options = LiveOptions(
-                model=self.model,
-                language=self.language,
-                smart_format=True,
-                encoding="linear16",
-                channels=1,
-                sample_rate=16000,  # Browser sends 16kHz
-                interim_results=True,
-                utterance_end_ms="1000",
-                vad_events=True,  # Enable VAD events for barge-in
-            )
-            
-            await self._connection.start(options)
-            self._is_connected = True
-            logger.info("Deepgram STT connected")
-            return True
-            
-        except Exception as e:
-            import traceback
-            logger.error(f"Failed to connect to Deepgram: {e}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            logger.error(f"API Key present: {bool(settings.DEEPGRAM_API_KEY)}, Length: {len(settings.DEEPGRAM_API_KEY) if settings.DEEPGRAM_API_KEY else 0}")
-            self._is_connected = False
-            return False
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Deepgram connection attempt {attempt + 1}/{max_retries}...")
+                
+                config = DeepgramClientOptions(options={"keepalive": "true"})
+                self._client = DeepgramClient(settings.DEEPGRAM_API_KEY, config)
+                self._connection = self._client.listen.asynclive.v("1")
+                
+                # Set up event handlers
+                self._connection.on(LiveTranscriptionEvents.Transcript, self._on_message)
+                self._connection.on(LiveTranscriptionEvents.SpeechStarted, self._on_speech_started)
+                self._connection.on(LiveTranscriptionEvents.Error, self._on_error)
+                
+                # Configure live options
+                options = LiveOptions(
+                    model=self.model,
+                    language=self.language,
+                    smart_format=True,
+                    encoding="linear16",
+                    channels=1,
+                    sample_rate=16000,  # Browser sends 16kHz
+                    interim_results=True,
+                    utterance_end_ms="1000",
+                    vad_events=True,  # Enable VAD events for barge-in
+                )
+                
+                # Use asyncio.wait_for with a shorter timeout for faster fallback
+                await asyncio.wait_for(
+                    self._connection.start(options),
+                    timeout=3.0  # Reduced validation timeout (was 15.0)
+                )
+                self._is_connected = True
+                logger.info("✅ Deepgram STT connected successfully")
+                return True
+                
+            except asyncio.TimeoutError:
+                logger.warning(f"Deepgram connection attempt {attempt + 1} timed out")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)  # Brief pause before retry
+                continue
+                    
+            except Exception as e:
+                import traceback
+                logger.error(f"Failed to connect to Deepgram (attempt {attempt + 1}): {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                logger.error(f"API Key present: {bool(settings.DEEPGRAM_API_KEY)}, Length: {len(settings.DEEPGRAM_API_KEY) if settings.DEEPGRAM_API_KEY else 0}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                continue
+        
+        logger.error("❌ All Deepgram connection attempts failed. Check your API key and network.")
+        self._is_connected = False
+        return False
     
     async def send_audio(self, audio_data: bytes):
         """
