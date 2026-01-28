@@ -237,17 +237,19 @@ class BookingManager:
     async def _generate_success_response(self, slot: BookingSlot, user_message: str) -> str:
         """Generate a natural success/confirmation message, addressing any side questions."""
         system_prompt = (
-            "You are Bella, a professional restaurant hostess.\n"
+            "You are Bella, the warm and charming hostess at Bella Cucina, an authentic Italian restaurant.\n"
             "We have all the details needed to make a reservation.\n"
             f"Requested Booking: Table for {slot.party_size} on {slot.date} at {slot.time} under the name {slot.name}.\n"
             f"User's Last Message: \"{user_message}\"\n\n"
             "TASK: Ask the user to CONFIRM they want to proceed with this booking.\n"
             "CRITICAL RULES:\n"
-            "1. DO NOT say 'we have booked' or 'reservation confirmed' - IT IS NOT YET CONFIRMED.\n"
-            "2. Present the details and ask 'Shall I confirm this booking?' or 'Would you like me to book this?'\n"
-            "3. SIDE QUESTIONS: If the user asked a question in their last message (e.g. 'parking?', 'vegan?'), ANSWER IT FIRST briefly.\n"
-            "4. STYLE: Conversational, warm, short (1-2 sentences).\n"
-            "5. Example: 'I have a table for 4 on Friday at 7 PM under John. Shall I confirm?'"
+            "1. PERSONA: Be warm, professional, but not robotic. A tiny bit of Italian flair is okay (e.g. 'Eccellente').\n"
+            "2. DO NOT say 'we have booked' or 'reservation confirmed' - IT IS NOT YET CONFIRMED.\n"
+            "3. Present the details and ask 'Shall I confirm this booking?' or 'Would you like me to book this?'\n"
+            "4. SIDE QUESTIONS: If the user asked a question in their last message (e.g. 'parking?', 'vegan?'), ANSWER IT FIRST briefly.\n"
+            "5. AVOID REPETITION: If the conversation history shows you already presented the details, just ask 'Ready to confirm?' briefly.\n"
+            "6. STYLE: Conversational, warm, short (1-2 sentences).\n"
+            "7. Example: 'I have a table for 4 on Friday at 7 PM under John. Shall I confirm?'"
         )
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
@@ -319,7 +321,6 @@ class BookingManager:
                 })
                 
                 # Extract booking ID from result for future updates/cancellations
-                import re
                 booking_id_match = re.search(r'booking ID is (\d+)', result)
                 if booking_id_match:
                     state.last_booking_id = int(booking_id_match.group(1))
@@ -401,6 +402,7 @@ class BookingManager:
         # We're missing information, ask for it naturally
         missing = state.booking_slot.get_missing_fields()
         return await self._ask_for_missing_info(missing, state.booking_slot, user_message)
+    
     
     def _is_confirmation(self, message: str) -> bool:
         """Check if message is a confirmation."""
