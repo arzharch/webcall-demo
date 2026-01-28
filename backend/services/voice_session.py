@@ -74,9 +74,9 @@ class VoiceSession:
     """
     
     # Buffer settings
-    DEBOUNCE_DELAY = 1.0  # Seconds to wait for continuation
-    MAX_BUFFER_SIZE = 10  # Max transcript chunks before force processing
-    MAX_ACCUMULATION_TIME = 8.0  # Max seconds to accumulate
+    DEBOUNCE_DELAY = 1.2  # Increased for better buffering of "extended queries" (was 1.0)
+    MAX_BUFFER_SIZE = 15  # Max transcript chunks before force processing
+    MAX_ACCUMULATION_TIME = 10.0  # Max seconds to accumulate
     
     def __init__(
         self,
@@ -165,12 +165,16 @@ class VoiceSession:
             system_audio = get_system_audio()
             
             # Send connecting audio (ringing) to keep user engaged
-            connecting_audio = system_audio.get_ringing_audio()
-            if connecting_audio:
-                logger.info("Playing connecting audio...")
-                await self._send_audio(connecting_audio)
+            # We play it repeatedly or once depending on length. Our WAV is ~3s.
+            starting_audio = system_audio.get_connecting_audio()
+            ringing_audio = system_audio.get_ringing_audio()
+            
+            if ringing_audio:
+                logger.info("Playing ringing sound...")
+                await self._send_audio(ringing_audio)
             
             # Initialize STT with fallback (Deepgram -> Google Cloud)
+            # Reduced timeout means connection happens faster, so ring doesn't need to loop long.
             self.stt = STTFallbackService(
                 on_speech_start=self._on_speech_start,
                 on_final_transcript=self._on_transcript,
@@ -253,7 +257,11 @@ class VoiceSession:
         except Exception as e:
             logger.error(f"Failed to save call analytics: {e}")
         
-        await self._send_status("ended", reason)
+        try:
+            await self._send_status("ended", reason)
+        except Exception:
+            # Ignore errors when sending end status (e.g. WebSocket already closed)
+            pass
     
     # ==================== STT Callbacks ====================
     
@@ -308,7 +316,8 @@ class VoiceSession:
             logger.debug(f"Force processing buffer (size: {len(self._input_buffer)})")
             if self._debounce_task:
                 self._debounce_task.cancel()
-            await self._process_buffer()
+            # Run in background to avoid blocking the callback loop
+            asyncio.create_task(self._process_buffer())
             return
         
         # Reschedule debounce

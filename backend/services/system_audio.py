@@ -105,40 +105,31 @@ class SystemAudioService:
     
     def _generate_ringing_tone(self):
         """
-        Generate a gentle ringing/connecting tone.
-        Uses a soft "ring ring" phrase synthesized with TTS.
+        Load the pre-generated ringing tone from file.
         """
-        # For simplicity, we use TTS to create a "ringing" effect
-        # In production, you might use an actual audio file
-        ringing_phrase = "Connecting your call... ring... ring..."
-        
+        import os
         try:
-            if self._client:
-                input_text = texttospeech.SynthesisInput(text=ringing_phrase)
-                
-                voice = texttospeech.VoiceSelectionParams(
-                    language_code=self.language_code,
-                    name=self.voice_name,
-                )
-                
-                # Slower rate for ringing effect
-                audio_config = texttospeech.AudioConfig(
-                    audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-                    sample_rate_hertz=24000,
-                    speaking_rate=0.85,  # Slower for dramatic effect
-                )
-                
-                response = self._client.synthesize_speech(
-                    input=input_text,
-                    voice=voice,
-                    audio_config=audio_config
-                )
-                
-                self._ringing_audio = response.audio_content
-                logger.debug("Generated ringing tone")
+            # Path to the generated WAV file
+            file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "ringing.wav")
+            
+            if os.path.exists(file_path):
+                with open(file_path, "rb") as f:
+                    # Skip header (44 bytes) for raw PCM streaming if needed, 
+                    # but our system usually handles header or raw.
+                    # Deepgram/Google TTS usually output raw LINEAR16 or containerized.
+                    # Our frontend logic (useVoiceCall) converts Int16Array -> Float32, expecting raw PCM?
+                    # Actually useVoiceCall expects raw PCM or it handles ArrayBuffer. 
+                    # A standard WAV has a 44-byte header. Sending it might cause a small 'pop' but usually works.
+                    # Ideally we strip it for pure PCM16 stream.
+                    data = f.read()
+                    self._ringing_audio = data[44:] # Strip WAV header to get raw PCM
+                logger.info("✅ Loaded real ringing sound effect")
+            else:
+                logger.warning("Ringing WAV file not found, falling back to silent connect")
+                self._ringing_audio = None
                 
         except Exception as e:
-            logger.warning(f"Failed to generate ringing tone: {e}")
+            logger.warning(f"Failed to load ringing tone: {e}")
     
     def get_audio(self, key: str) -> Optional[bytes]:
         """

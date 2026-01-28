@@ -20,6 +20,7 @@ load_dotenv()
 
 from config import settings
 from services.voice_session import VoiceSession, VoiceSessionManager, get_voice_session_manager
+from services.system_audio import preload_system_audio
 import database as db
 from infra import get_health_checker, setup_logging
 
@@ -41,6 +42,14 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Starting Bella Voice API...")
     db.init_database()
     logger.info("✅ Database initialized")
+    
+    # Preload system audio assets (ringing, error messages, etc.)
+    try:
+        logger.info("📢 Preloading system audio assets...")
+        preload_system_audio()
+        logger.info("✅ System audio preloaded")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to preload system audio: {e}")
     
     yield
     
