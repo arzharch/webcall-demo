@@ -1,65 +1,201 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+import { useCallback, useState, useEffect } from "react";
+import { useVoiceCall } from "@/hooks/useVoiceCall";
+import {
+  CallButton,
+  NameInput,
+  StatusIndicator,
+  TranscriptDisplay,
+  Waveform,
+} from "@/components";
+import { validateCallerName, sanitizeInput } from "@/lib/api";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger("HomePage");
+
+export default function HomePage() {
+  const [callerName, setCallerName] = useState("");
+  const [nameError, setNameError] = useState<string | undefined>();
+  const [isReady, setIsReady] = useState(false);
+
+  const {
+    status,
+    sessionId,
+    isConnected,
+    isSpeaking,
+    transcripts,
+    startCall,
+    endCall,
+    error,
+    callDuration,
+  } = useVoiceCall();
+
+  // Log mount
+  useEffect(() => {
+    logger.info("Page mounted");
+    return () => logger.info("Page unmounted");
+  }, []);
+
+  // Log status changes
+  useEffect(() => {
+    logger.info("Call status changed", { status, sessionId, isConnected });
+  }, [status, sessionId, isConnected]);
+
+  // Log errors
+  useEffect(() => {
+    if (error) {
+      logger.error("Call error", { error });
+    }
+  }, [error]);
+
+  // Handle name input change with validation
+  const handleNameChange = useCallback((value: string) => {
+    const sanitized = sanitizeInput(value);
+    setCallerName(sanitized);
+    
+    if (sanitized.length === 0) {
+      setNameError(undefined);
+      setIsReady(false);
+      return;
+    }
+
+    const validation = validateCallerName(sanitized);
+    if (!validation.valid) {
+      setNameError(validation.error);
+      setIsReady(false);
+    } else {
+      setNameError(undefined);
+      setIsReady(true);
+    }
+  }, []);
+
+  // Handle call button click
+  const handleCallClick = useCallback(async () => {
+    if (status === "idle" || status === "error") {
+      // Starting call
+      if (!isReady) {
+        logger.warn("Attempted to start call without valid name");
+        setNameError("Please enter a valid name");
+        return;
+      }
+      logger.info("Starting call", { callerName });
+      await startCall(callerName.trim());
+    } else if (status === "active" || status === "connected" || status === "connecting" || status === "processing" || status === "speaking") {
+      // Ending call
+      logger.info("Ending call");
+      endCall();
+    }
+  }, [status, isReady, callerName, startCall, endCall]);
+
+  // Determine if we're in an active call state
+  const isInCall = status === "connecting" || status === "connected" || status === "active" || status === "processing" || status === "speaking";
+  const canStartCall = isReady && (status === "idle" || status === "error");
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
+    <main className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-white flex flex-col">
+      {/* Decorative gradient orbs */}
+      <div className="fixed inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute -top-40 -right-40 w-80 h-80 bg-gradient-to-br from-amber-500/20 to-orange-500/10 rounded-full blur-3xl" />
+        <div className="absolute -bottom-40 -left-40 w-80 h-80 bg-gradient-to-tr from-blue-500/10 to-purple-500/10 rounded-full blur-3xl" />
+      </div>
+
+      {/* Content */}
+      <div className="relative z-10 flex flex-col items-center justify-center flex-1 px-4 py-8 animate-fade-in">
+        {/* Header */}
+        <header className="text-center mb-8 animate-fade-in-up">
+          <h1 className="text-4xl md:text-5xl font-bold bg-gradient-to-r from-amber-400 via-orange-400 to-amber-500 bg-clip-text text-transparent mb-2">
+            Bella
           </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+          <p className="text-slate-400 text-sm md:text-base">
+            Voice Assistant for Restaurant Reservations
           </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
+        </header>
+
+        {/* Main Card */}
+        <div className="glass-effect rounded-3xl p-6 md:p-8 w-full max-w-md animate-fade-in-up animation-delay-100">
+          {/* Status Indicator */}
+          <div className="flex justify-center mb-6">
+            <StatusIndicator
+              status={status}
+              duration={callDuration}
+              sessionId={sessionId}
             />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+          </div>
+
+          {/* Waveform Animation */}
+          <div className="flex justify-center mb-8">
+            <Waveform
+              isActive={isConnected}
+              isSpeaking={isSpeaking}
+              barCount={24}
+            />
+          </div>
+
+          {/* Name Input - only show when not in call */}
+          {!isInCall && (
+            <div className="mb-6 animate-fade-in">
+              <NameInput
+                value={callerName}
+                onChange={handleNameChange}
+                error={nameError}
+                disabled={isInCall}
+                placeholder="Enter your name"
+              />
+            </div>
+          )}
+
+          {/* Caller name display during call */}
+          {isInCall && callerName && (
+            <div className="text-center mb-6 animate-fade-in">
+              <span className="text-slate-400 text-sm">Calling as </span>
+              <span className="text-amber-400 font-medium">{callerName}</span>
+            </div>
+          )}
+
+          {/* Call Button */}
+          <div className="flex justify-center mb-6">
+            <CallButton
+              status={status}
+              onClick={handleCallClick}
+              disabled={!canStartCall && status === "idle"}
+            />
+          </div>
+
+          {/* Error Display */}
+          {error && (
+            <div className="text-center mb-4 animate-fade-in">
+              <p className="text-red-400 text-sm bg-red-500/10 rounded-lg px-4 py-2">
+                {error}
+              </p>
+            </div>
+          )}
+
+          {/* Hint Text */}
+          {status === "idle" && (
+            <p className="text-center text-slate-500 text-xs animate-fade-in">
+              {canStartCall
+                ? "Tap the button to start your call"
+                : "Enter your name to begin"}
+            </p>
+          )}
         </div>
-      </main>
-    </div>
+
+        {/* Transcript Section */}
+        {transcripts.length > 0 && (
+          <div className="w-full max-w-md mt-6 animate-fade-in-up animation-delay-200">
+            <TranscriptDisplay
+              transcripts={transcripts}
+              maxHeight="240px"
+            />
+          </div>
+        )}
+
+        {/* Footer */}
+        <footer className="mt-8 text-center text-slate-600 text-xs animate-fade-in animation-delay-300">
+          <p>Powered by AI Voice Technology</p>
+        </footer>
+      </div>
+    </main>
   );
 }
