@@ -170,8 +170,10 @@ class VoiceSession:
             ringing_audio = system_audio.get_ringing_audio()
             
             if ringing_audio:
-                logger.info("Playing ringing sound...")
+                logger.info(f"🔔 Playing ringing sound: {len(ringing_audio)} bytes")
                 await self._send_audio(ringing_audio)
+            else:
+                logger.warning("No ringing audio available")
             
             # Initialize STT with fallback (Deepgram -> Google Cloud)
             # Reduced timeout means connection happens faster, so ring doesn't need to loop long.
@@ -299,6 +301,13 @@ class VoiceSession:
     
     async def _handle_transcript(self, text: str):
         """Process a transcript segment."""
+        logger.debug(f"[{self.session_id}] Transcript received: {text}")
+        
+        # If speaking (TTS playing), allow interrupt
+        if self._is_speaking:
+            logger.info(f"[{self.session_id}] User speaking during TTS - stopping playback")
+            self._stop_playback = True
+        
         # Track buffer start time
         if not self._input_buffer:
             self._buffer_start_time = time.time()
@@ -360,6 +369,18 @@ class VoiceSession:
         # Store for potential rescue on interruption
         self._current_processing_text = full_text
         
+        # CRITICAL: Reset stop flag before starting agent - ensures clean state for new response
+        self._stop_playback = False
+        self._is_speaking = False
+        
+        # Cancel any previous agent task that might still be running
+        if self._agent_task and not self._agent_task.done():
+            self._agent_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(self._agent_task), timeout=0.1)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        
         # Process through agent
         self._agent_task = asyncio.create_task(self._run_agent(full_text))
     
@@ -389,6 +410,11 @@ class VoiceSession:
                         async for chunk in self.agent.orchestrator.process_message(
                             self.agent.state, text
                         ):
+                            # Check for interruption DURING streaming
+                            if self._stop_playback:
+                                logger.info("Agent streaming interrupted by new input")
+                                break
+                            
                             # Handle error tokens
                             if "Invalid Format" in str(chunk) or "Exception" in str(chunk):
                                 logger.warning(f"Suppressed error: {chunk}")
@@ -499,7 +525,10 @@ class VoiceSession:
             self.metrics.total_tts_ms += tts_ms
             
             if audio and not self._stop_playback:
+                logger.info(f"🔊 Sending TTS audio: {len(audio)} bytes")
                 await self._send_audio(audio)
+            elif not audio:
+                logger.warning(f"TTS returned no audio for: {text[:50]}...")
                 
         except Exception as e:
             logger.error(f"TTS error: {e}")

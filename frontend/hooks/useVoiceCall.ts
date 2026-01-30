@@ -46,7 +46,8 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}): UseVoiceCallRet
   
   // Refs
   const wsRef = useRef<WebSocket | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);  // For capture @ 16kHz
+  const playbackContextRef = useRef<AudioContext | null>(null);  // For playback @ 24kHz
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null); // Visualizer node
   const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -74,10 +75,34 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}): UseVoiceCallRet
     onTranscript?.(entry);
   }, [onTranscript]);
 
-  // Play audio from queue
+  // Play audio from queue - uses separate 24kHz playback context
   const playNextAudio = useCallback(async () => {
-    if (isPlayingRef.current || audioQueueRef.current.length === 0) return;
-    if (!audioContextRef.current) return;
+    logger.debug(`playNextAudio called: isPlaying=${isPlayingRef.current}, queue=${audioQueueRef.current.length}`);
+    
+    if (isPlayingRef.current || audioQueueRef.current.length === 0) {
+      return;
+    }
+    
+    // Create playback context if needed (at 24kHz for TTS audio)
+    if (!playbackContextRef.current || playbackContextRef.current.state === 'closed') {
+      playbackContextRef.current = new AudioContext({ sampleRate: PLAYBACK_SAMPLE_RATE });
+      logger.info('Created playback audio context at 24kHz');
+    }
+    
+    const ctx = playbackContextRef.current;
+    logger.debug(`Playback context state: ${ctx.state}`);
+    
+    // CRITICAL: Resume audio context if suspended (browser autoplay policy)
+    if (ctx.state === 'suspended') {
+      logger.info('Resuming suspended audio context...');
+      try {
+        await ctx.resume();
+        logger.info('Audio context resumed successfully');
+      } catch (e) {
+        logger.error('Failed to resume audio context', e);
+        return;
+      }
+    }
     
     isPlayingRef.current = true;
     setIsSpeaking(true);
@@ -90,8 +115,6 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}): UseVoiceCallRet
     }
     
     try {
-      const ctx = audioContextRef.current;
-      
       // Convert LINEAR16 to Float32
       const int16Array = new Int16Array(audioData);
       const float32Array = new Float32Array(int16Array.length);
@@ -99,23 +122,21 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}): UseVoiceCallRet
         float32Array[i] = int16Array[i] / 32768;
       }
       
-      // Create audio buffer
+      logger.info(`▶️ Playing audio: ${int16Array.length} samples (${(int16Array.length / PLAYBACK_SAMPLE_RATE).toFixed(2)}s)`);
+      
+      // Create audio buffer at playback sample rate
       const audioBuffer = ctx.createBuffer(1, float32Array.length, PLAYBACK_SAMPLE_RATE);
       audioBuffer.getChannelData(0).set(float32Array);
       
       // Play buffer
       const source = ctx.createBufferSource();
-      source.buffer = audioBuffer; // Assign buffer (missing in original code? No, createBufferSource logic was separate?)
+      source.buffer = audioBuffer;
       
-      // FIX: Connect directly to destination for playback
+      // Connect directly to destination for playback
       source.connect(ctx.destination);
       
-      // FIX: Connect to analyser separately (parallel) to avoid feeding Mic into Destination via Analyser
-      if (analyserRef.current) {
-        source.connect(analyserRef.current);
-      }
-      
       source.onended = () => {
+        logger.debug('Audio chunk finished playing');
         isPlayingRef.current = false;
         if (audioQueueRef.current.length > 0) {
           playNextAudio();
@@ -125,7 +146,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}): UseVoiceCallRet
       };
       
       source.start();
-      logger.debug(`Playing audio: ${float32Array.length} samples`);
+      logger.debug('Audio playback started');
     } catch (err) {
       logger.error('Audio playback error', err);
       isPlayingRef.current = false;
@@ -145,8 +166,17 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}): UseVoiceCallRet
         const buffer = event.data instanceof Blob 
           ? await event.data.arrayBuffer() 
           : event.data;
+        
+        // Validate audio data
+        if (buffer.byteLength < 100) {
+          logger.warn(`Ignoring tiny audio chunk: ${buffer.byteLength} bytes`);
+          return;
+        }
+        
         audioQueueRef.current.push(buffer);
-        logger.debug(`Audio received: ${buffer.byteLength} bytes`);
+        logger.info(`🔊 Audio received: ${buffer.byteLength} bytes, queue: ${audioQueueRef.current.length}, isPlaying: ${isPlayingRef.current}`);
+        
+        // Always try to play - playNextAudio will check if already playing
         playNextAudio();
       };
       handleBinary();
@@ -221,9 +251,19 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}): UseVoiceCallRet
       mediaStreamRef.current = stream;
       logger.info('Microphone access granted');
       
-      // Create audio context
+      // Create capture audio context @ 16kHz
       audioContextRef.current = new AudioContext({ sampleRate: CAPTURE_SAMPLE_RATE });
       const ctx = audioContextRef.current;
+      
+      // Pre-create playback audio context @ 24kHz (user interaction already happened via button click)
+      playbackContextRef.current = new AudioContext({ sampleRate: PLAYBACK_SAMPLE_RATE });
+      // Immediately resume to ensure it's ready for playback
+      await playbackContextRef.current.resume();
+      logger.info(`Created playback audio context at 24kHz (state: ${playbackContextRef.current.state})`);
+      
+      // Reset playback state for new call
+      isPlayingRef.current = false;
+      audioQueueRef.current = [];
       
       // Create Analyser
       const analyser = ctx.createAnalyser();
@@ -346,10 +386,16 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}): UseVoiceCallRet
       mediaStreamRef.current = null;
     }
     
-    // Close audio context
+    // Close capture audio context
     if (audioContextRef.current) {
       audioContextRef.current.close();
       audioContextRef.current = null;
+    }
+    
+    // Close playback audio context
+    if (playbackContextRef.current) {
+      playbackContextRef.current.close();
+      playbackContextRef.current = null;
     }
     
     // Clear audio queue
@@ -371,6 +417,9 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}): UseVoiceCallRet
       }
       if (audioContextRef.current) {
         audioContextRef.current.close();
+      }
+      if (playbackContextRef.current) {
+        playbackContextRef.current.close();
       }
       if (durationIntervalRef.current) {
         clearInterval(durationIntervalRef.current);
