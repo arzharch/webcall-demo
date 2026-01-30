@@ -49,7 +49,7 @@ The backend requires an API key for the Gemini LLM.
 - Create a file named `.env` inside the `backend` directory.
 - Add your API key to this file in the following format:
   ```
-  GEMINI_API_KEY="your_gemini_api_key_here"
+  GOOGLE_API_KEY="your_GOOGLE_API_KEY_here"
   ```
 
 ### 3. Frontend Setup
@@ -93,7 +93,7 @@ With the backend running, open a *new* terminal for the frontend.
   ```bash
   npm start
   ```
-This will open the application in your web browser, usually at `http://localhost:3000`. You can then use the UI to start a voice call with the backend.
+This will open the application in your web browser, usually at `http://localhost:3000`. You can then use the UI to start a voice call with the 
 
 ---
 *This project is being built by an AI agent. The setup instructions will be updated as the project progresses.*
