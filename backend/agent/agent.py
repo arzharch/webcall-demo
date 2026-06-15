@@ -12,8 +12,6 @@ except ImportError:  # Fallback until langchain-ollama is installed everywhere
 
 from agent.state import SessionState
 from agent.orchestrator import ConversationOrchestrator
-# from prompts import get_system_prompt # Not needed if orchestrator handles prompts
-# from services.restaurant import RestaurantService, get_restaurant_service # Not needed if orchestrator handles tools
 
 
 class BellaAgent:
@@ -21,10 +19,7 @@ class BellaAgent:
 
     def __init__(self, state: SessionState):
         self.state = state
-        # The orchestrator will now manage the LLM and tools
-        # We need to pass an LLM instance to the orchestrator.
-        # Use OpenAI GPT-3.5 Turbo for better instruction following and low latency.
-        # Fallback to Ollama if OpenAI API key is missing happens in execution, but here we set up the object.
+        # Use OpenAI GPT-3.5 Turbo
         llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
         self.orchestrator = ConversationOrchestrator(llm=llm)
 

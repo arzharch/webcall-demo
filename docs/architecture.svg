@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" width="100%" height="100%">
+  <!-- Background -->
+  <rect width="1000" height="600" fill="#f8f9fa" rx="10"/>
+
+  <!-- Title -->
+  <text x="500" y="40" font-family="Arial, sans-serif" font-size="24" font-weight="bold" text-anchor="middle" fill="#343a40">Bella Cucina - Agentic Voice Bot Architecture</text>
+
+  <!-- Definitions for shadows and arrows -->
+  <defs>
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
+      <feDropShadow dx="2" dy="2" stdDeviation="3" flood-opacity="0.1"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6c757d"/>
+    </marker>
+  </defs>
+
+  <!-- User / Frontend -->
+  <rect x="50" y="250" width="180" height="100" rx="8" fill="#e3f2fd" stroke="#2196f3" stroke-width="2" filter="url(#shadow)"/>
+  <text x="140" y="295" font-family="Arial, sans-serif" font-size="16" font-weight="bold" text-anchor="middle" fill="#0d47a1">User / Browser</text>
+  <text x="140" y="320" font-family="Arial, sans-serif" font-size="14" text-anchor="middle" fill="#1565c0">Next.js Frontend</text>
+
+  <!-- Connection: User to Backend -->
+  <line x1="230" y1="300" x2="310" y2="300" stroke="#6c757d" stroke-width="2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <text x="270" y="290" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#495057">WebSocket / REST</text>
+
+  <!-- Backend / API Layer -->
+  <rect x="320" y="150" width="200" height="300" rx="8" fill="#e8f5e9" stroke="#4caf50" stroke-width="2" filter="url(#shadow)"/>
+  <text x="420" y="180" font-family="Arial, sans-serif" font-size="16" font-weight="bold" text-anchor="middle" fill="#1b5e20">API Layer</text>
+  <text x="420" y="205" font-family="Arial, sans-serif" font-size="14" text-anchor="middle" fill="#2e7d32">FastAPI Server</text>
+  
+  <rect x="340" y="230" width="160" height="40" rx="4" fill="#c8e6c9" stroke="#81c784" stroke-width="1"/>
+  <text x="420" y="255" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#1b5e20">Session Manager</text>
+
+  <rect x="340" y="290" width="160" height="40" rx="4" fill="#c8e6c9" stroke="#81c784" stroke-width="1"/>
+  <text x="420" y="315" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#1b5e20">WebSocket Handler</text>
+
+  <rect x="340" y="350" width="160" height="40" rx="4" fill="#c8e6c9" stroke="#81c784" stroke-width="1"/>
+  <text x="420" y="375" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#1b5e20">Audio Transport</text>
+
+  <!-- Connections from Backend to Speech Services -->
+  <line x1="420" y1="450" x2="420" y2="490" stroke="#6c757d" stroke-width="2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <text x="430" y="475" font-family="Arial, sans-serif" font-size="12" fill="#495057">Audio Chunks</text>
+
+  <!-- Speech Services -->
+  <rect x="250" y="500" width="340" height="80" rx="8" fill="#fff3e0" stroke="#ff9800" stroke-width="2" filter="url(#shadow)"/>
+  <text x="420" y="525" font-family="Arial, sans-serif" font-size="16" font-weight="bold" text-anchor="middle" fill="#e65100">Speech Pipeline</text>
+  <text x="320" y="555" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#ef6c00">STT: Faster-Whisper (VAD)</text>
+  <text x="520" y="555" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#ef6c00">TTS: Coqui XTTS v2</text>
+
+  <!-- Connection: Backend to Orchestrator -->
+  <line x1="520" y1="300" x2="600" y2="300" stroke="#6c757d" stroke-width="2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <text x="560" y="290" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#495057">Text / State</text>
+
+  <!-- Orchestrator / Brain -->
+  <rect x="610" y="150" width="200" height="200" rx="8" fill="#f3e5f5" stroke="#9c27b0" stroke-width="2" filter="url(#shadow)"/>
+  <text x="710" y="180" font-family="Arial, sans-serif" font-size="16" font-weight="bold" text-anchor="middle" fill="#4a148c">The "Brain"</text>
+  <text x="710" y="205" font-family="Arial, sans-serif" font-size="14" text-anchor="middle" fill="#6a1b9a">LangChain Orchestrator</text>
+
+  <rect x="630" y="230" width="160" height="40" rx="4" fill="#e1bee7" stroke="#ba68c8" stroke-width="1"/>
+  <text x="710" y="255" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#4a148c">LCEL Router / State</text>
+
+  <rect x="630" y="290" width="160" height="40" rx="4" fill="#e1bee7" stroke="#ba68c8" stroke-width="1"/>
+  <text x="710" y="315" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#4a148c">Tool Calling</text>
+
+  <!-- Connection: Orchestrator to LLM -->
+  <line x1="710" y1="150" x2="710" y2="100" stroke="#6c757d" stroke-width="2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <text x="720" y="130" font-family="Arial, sans-serif" font-size="12" fill="#495057">Prompts / Streaming</text>
+
+  <!-- LLM -->
+  <rect x="610" y="40" width="200" height="50" rx="8" fill="#fce4ec" stroke="#e91e63" stroke-width="2" filter="url(#shadow)"/>
+  <text x="710" y="70" font-family="Arial, sans-serif" font-size="14" font-weight="bold" text-anchor="middle" fill="#880e4f">Google Gemini 2.0 Flash</text>
+
+  <!-- Connection: Orchestrator to Data -->
+  <line x1="710" y1="350" x2="710" y2="420" stroke="#6c757d" stroke-width="2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <text x="720" y="390" font-family="Arial, sans-serif" font-size="12" fill="#495057">Query / Retrieve</text>
+
+  <!-- Tools / Data Sources -->
+  <rect x="610" y="430" width="200" height="120" rx="8" fill="#e0f7fa" stroke="#00bcd4" stroke-width="2" filter="url(#shadow)"/>
+  <text x="710" y="460" font-family="Arial, sans-serif" font-size="16" font-weight="bold" text-anchor="middle" fill="#006064">Data Sources &amp; Tools</text>
+  
+  <rect x="630" y="480" width="160" height="25" rx="4" fill="#b2ebf2" stroke="#4dd0e1" stroke-width="1"/>
+  <text x="710" y="497" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#006064">FAISS (Menu / FAQs)</text>
+
+  <rect x="630" y="515" width="160" height="25" rx="4" fill="#b2ebf2" stroke="#4dd0e1" stroke-width="1"/>
+  <text x="710" y="532" font-family="Arial, sans-serif" font-size="12" text-anchor="middle" fill="#006064">SQLite / JSON (Bookings)</text>
+
+</svg>

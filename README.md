@@ -2,14 +2,21 @@
 
 This project is a voice-driven AI assistant that handles restaurant reservations, answers menu questions, and manages bookings through natural conversation.
 
-## Architecture Overview
+## Architecture & Technology Stack
 
-The system is designed with a two-phased architecture:
+The system is designed with an advanced streaming architecture focusing on modularity and low-latency interaction. It acts as a highly responsive, interruptible agent using LangChain as an orchestrator (the "Streaming Brain") for a fluid conversational experience.
 
-1.  **Phase 1 (Core MVP):** A functional, modular voice bot built with FastAPI, using separate services for STT, TTS, LLM (Gemini), and RAG.
-2.  **Phase 2 (Advanced Streaming):** An evolution of the MVP into a low-latency, interruptible agent using LangChain as an orchestrator (the "Streaming Brain") for a more fluid conversational experience.
+![System Architecture](docs/architecture.svg)
 
-For a detailed breakdown of the architecture, components, and key concepts, please refer to the `workflow.md` file.
+### Key Technologies & Why We Use Them
+
+- **FastAPI**: Provides a high-performance REST API for session management and native WebSocket support for real-time audio streaming.
+- **LangChain & LCEL**: Powers the "Brain" of the bot. LangChain Expression Language (LCEL) allows us to build declarative, modular routing chains to classify user intents and seamlessly call external tools.
+- **Google Gemini 2.0 Flash**: Acts as the core LLM. Chosen for its extreme speed, advanced reasoning capabilities, and excellent function-calling reliability.
+- **Faster-Whisper (STT)**: A highly optimized transcription model running locally on CPU/INT8. Combined with Voice Activity Detection (VAD), it ensures low-latency speech recognition.
+- **Coqui XTTS v2 (TTS)**: An open-source text-to-speech engine capable of high-quality streaming synthesis, allowing the bot to start speaking before the full sentence is generated.
+- **FAISS & SQLite**: FAISS is used for fast local vector retrieval (RAG) of menu items and FAQs, while SQLite manages structured reservation data.
+- **Next.js & React**: Powers the frontend interface, offering a robust and responsive web client for users to initiate voice calls.
 
 ## Project Setup
 
@@ -42,15 +49,6 @@ All required Python packages are listed in `backend/requirements.txt`. Install t
 ```bash
 pip install -r backend/requirements.txt
 ```
-
-**d. Configure Environment Variables:**
-The backend requires an API key for the Gemini LLM.
-
-- Create a file named `.env` inside the `backend` directory.
-- Add your API key to this file in the following format:
-  ```
-  GOOGLE_API_KEY="your_GOOGLE_API_KEY_here"
-  ```
 
 ### 3. Frontend Setup
 
@@ -89,9 +87,9 @@ With the backend running, open a *new* terminal for the frontend.
   ```bash
   cd frontend
   ```
-- **Start the React development server:**
+- **Start the NextJs development server:**
   ```bash
-  npm start
+  npm run dev
   ```
 This will open the application in your web browser, usually at `http://localhost:3000`. You can then use the UI to start a voice call with the 
 

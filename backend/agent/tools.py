@@ -109,8 +109,9 @@ def make_booking(
 
     with open(TICKETS_FILE, "w") as f:
         json.dump(tickets, f, indent=2)
-
-    return f"I've made a booking for {name} for {party_size} people on {date_str} at {time_str}. The booking ID is {ticket['id']}. We look forward to seeing you!"
+    
+    notes_msg = f" I've also noted your request: '{notes}'." if notes else ""
+    return f"I've made a booking for {name} for {party_size} people on {date_str} at {time_str}.{notes_msg} The booking ID is {ticket['id']}. We look forward to seeing you!"
 
 
 @tool

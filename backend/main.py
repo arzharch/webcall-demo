@@ -147,12 +147,13 @@ async def health_check():
     Returns status of all dependencies.
     """
     checker = get_health_checker()
-    health = await checker.check_all()
+    health = checker.check_health()
     
-    status = "healthy" if health.get("healthy", False) else "unhealthy"
+    # Correctly extract status and components from the health dict
+    status = health.get("status", "unhealthy")
     return HealthResponse(
         status=status,
-        checks=health.get("checks", {})
+        checks=health.get("components", {})
     )
 
 

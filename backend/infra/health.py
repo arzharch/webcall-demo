@@ -47,12 +47,36 @@ class HealthChecker:
     def _register_default_checks(self):
         """Register built-in health checks."""
         self.register_check("redis", self._check_redis)
+        self.register_check("database", self._check_database)
         self.register_check("circuit_breakers", self._check_circuit_breakers)
         self.register_check("telemetry", self._check_telemetry)
     
     def register_check(self, name: str, check_fn: Callable[[], ComponentHealth]):
         """Register a custom health check."""
         self._checks[name] = check_fn
+
+    def _check_database(self) -> ComponentHealth:
+        """Check SQLite database connectivity."""
+        start = time.time()
+        try:
+            import database as db
+            with db.get_db() as conn:
+                conn.execute("SELECT 1")
+            
+            latency = (time.time() - start) * 1000
+            return ComponentHealth(
+                name="database",
+                status=HealthStatus.HEALTHY,
+                latency_ms=latency,
+                message="Connected",
+            )
+        except Exception as e:
+            return ComponentHealth(
+                name="database",
+                status=HealthStatus.UNHEALTHY,
+                latency_ms=(time.time() - start) * 1000,
+                message=str(e),
+            )
     
     def _check_redis(self) -> ComponentHealth:
         """Check Redis connectivity."""
@@ -101,27 +125,40 @@ class HealthChecker:
     def _check_circuit_breakers(self) -> ComponentHealth:
         """Check circuit breaker states."""
         try:
-            manager = CircuitBreakerManager()
-            status = manager.get_status()
+            from infra.circuit_breaker import get_circuit_manager
+            manager = get_circuit_manager()
+            health = manager.health_check()
+            stats = manager.get_all_stats()
+            
+            # health_check returns {name: is_available}
+            # stats returns {name: CircuitStats}
             
             open_breakers = [
-                name for name, state in status.items()
-                if state.get("state") == "open"
+                name for name, available in health.items()
+                if not available
             ]
+            
+            details = {
+                name: {
+                    "state": s.state.value,
+                    "failure_count": s.failure_count,
+                    "total_calls": s.total_calls
+                } for name, s in stats.items()
+            }
             
             if open_breakers:
                 return ComponentHealth(
                     name="circuit_breakers",
                     status=HealthStatus.DEGRADED,
                     message=f"Open circuits: {', '.join(open_breakers)}",
-                    details=status,
+                    details=details,
                 )
             
             return ComponentHealth(
                 name="circuit_breakers",
                 status=HealthStatus.HEALTHY,
                 message="All circuits closed",
-                details=status,
+                details=details,
             )
         except Exception as e:
             return ComponentHealth(

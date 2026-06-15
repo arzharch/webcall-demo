@@ -28,20 +28,20 @@ class BookingSlot(BaseModel):
     
     def is_complete_for_new_booking(self) -> bool:
         """Check if we have all required info for a new booking."""
-        # Name is optional - can use caller_name instead
-        return all([self.party_size, self.date, self.time])
+        # Name, party_size, date, and time are all required for a proper booking
+        return all([self.name, self.party_size, self.date, self.time])
     
     def get_missing_fields(self) -> List[str]:
         """Get list of missing required fields."""
         missing = []
+        if not self.name:
+            missing.append("name")
         if not self.party_size:
             missing.append("party_size")
         if not self.date:
             missing.append("date")
         if not self.time:
             missing.append("time")
-        if not self.name:
-            missing.append("name")
         return missing
 
 

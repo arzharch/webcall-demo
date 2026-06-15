@@ -9,7 +9,7 @@ import type { HealthCheck, DailyStats, BookingInfo, CallSession } from './types'
 const logger = createLogger('API');
 
 // API configuration
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8001';
 const REQUEST_TIMEOUT = 10000; // 10 seconds
 
 // Request ID for tracking
@@ -30,19 +30,19 @@ export function sanitizeInput(input: string): string {
  */
 export function validateCallerName(name: string): { valid: boolean; error?: string } {
   const sanitized = sanitizeInput(name);
-  
+
   if (sanitized.length < 2) {
     return { valid: false, error: 'Name must be at least 2 characters' };
   }
-  
+
   if (sanitized.length > 50) {
     return { valid: false, error: 'Name must be less than 50 characters' };
   }
-  
+
   if (!/^[a-zA-Z\s'-]+$/.test(sanitized)) {
     return { valid: false, error: 'Name can only contain letters, spaces, hyphens, and apostrophes' };
   }
-  
+
   return { valid: true };
 }
 
@@ -71,9 +71,9 @@ async function fetchWithTimeout(
   const id = ++requestId;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
-  
+
   logger.debug(`[${id}] Request: ${options.method || 'GET'} ${url}`);
-  
+
   try {
     const response = await fetch(url, {
       ...options,
@@ -83,11 +83,11 @@ async function fetchWithTimeout(
         ...options.headers,
       },
     });
-    
+
     clearTimeout(timeoutId);
-    
+
     logger.debug(`[${id}] Response: ${response.status}`);
-    
+
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
       throw new APIError(
@@ -96,13 +96,13 @@ async function fetchWithTimeout(
         errorData.code
       );
     }
-    
+
     return response;
   } catch (error) {
     clearTimeout(timeoutId);
-    
+
     if (error instanceof APIError) throw error;
-    
+
     if (error instanceof Error) {
       if (error.name === 'AbortError') {
         logger.error(`[${id}] Request timeout`);
@@ -111,7 +111,7 @@ async function fetchWithTimeout(
       logger.error(`[${id}] Request error: ${error.message}`);
       throw new APIError(error.message, 0, 'NETWORK_ERROR');
     }
-    
+
     throw new APIError('Unknown error', 0, 'UNKNOWN');
   }
 }
@@ -127,7 +127,7 @@ export const api = {
     const response = await fetchWithTimeout(`${API_BASE_URL}/health`);
     return response.json();
   },
-  
+
   /**
    * Get daily statistics
    */
@@ -136,7 +136,7 @@ export const api = {
     const response = await fetchWithTimeout(`${API_BASE_URL}/stats${params}`);
     return response.json();
   },
-  
+
   /**
    * List active sessions
    */
@@ -144,7 +144,7 @@ export const api = {
     const response = await fetchWithTimeout(`${API_BASE_URL}/sessions`);
     return response.json();
   },
-  
+
   /**
    * Get call details
    */
@@ -152,7 +152,7 @@ export const api = {
     const response = await fetchWithTimeout(`${API_BASE_URL}/calls/${callId}`);
     return response.json();
   },
-  
+
   /**
    * List bookings
    */
@@ -164,7 +164,7 @@ export const api = {
     const response = await fetchWithTimeout(`${API_BASE_URL}/bookings${query}`);
     return response.json();
   },
-  
+
   /**
    * Get booking by ID
    */
@@ -172,7 +172,7 @@ export const api = {
     const response = await fetchWithTimeout(`${API_BASE_URL}/bookings/${bookingId}`);
     return response.json();
   },
-  
+
   /**
    * Get WebSocket URL for voice call
    */

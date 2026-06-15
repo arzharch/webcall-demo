@@ -269,6 +269,13 @@ class ConversationOrchestrator:
         """Wrapper to call booking manager since RunnableLambda doesn't await properly in branch"""
         return await self.booking_manager.handle_booking_conversation(state, user_message)
 
+    # Define keywords for fast intent switching detection
+    INTENT_SWITCH_KEYWORDS = {
+        "cancel_booking": {"cancel", "delete", "remove booking"},
+        "update_booking": {"update", "change", "modify", "postpone", "reschedule", "move"},
+        "find_booking": {"find", "look up", "check my", "my booking", "my reservation", "how many reservations"},
+    }
+
     async def process_message(
         self, state: SessionState, user_message: str
     ) -> AsyncGenerator[str, None]:
@@ -290,14 +297,10 @@ class ConversationOrchestrator:
 
         # Check for intent-switching keywords that override current flow
         lower_msg = user_message.lower()
-        intent_switch_keywords = {
-            "cancel_booking": ["cancel", "delete", "remove booking"],
-            "update_booking": ["update", "change", "modify", "postpone", "reschedule", "move"],
-            "find_booking": ["find", "look up", "check my", "my booking", "my reservation", "how many reservations"],
-        }
-        
         force_reclassify = False
-        for intent, keywords in intent_switch_keywords.items():
+        
+        # Quick keyword check
+        for intent, keywords in self.INTENT_SWITCH_KEYWORDS.items():
             if any(kw in lower_msg for kw in keywords):
                 force_reclassify = True
                 break

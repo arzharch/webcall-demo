@@ -1,0 +1,57 @@
+# Dockerignore - exclude unnecessary files from container
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+.venv13/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Environment files (use Secret Manager instead)
+.env
+*.local
+
+# Test files
+test_*.py
+*_test.py
+tests/
+
+# Documentation
+*.md
+!README.md
+
+# Logs
+*.log
+
+# Data files (if not needed in container)
+data/faiss_index.index
+data/faiss_index.pkl
+
+# Audio test files
+*.wav
+*.mp3
+stt_audio_test.py
+tts_trial.py
+
+# Old versions
+tinker_voice_v1.py
+demo/

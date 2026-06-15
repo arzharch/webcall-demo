@@ -63,39 +63,22 @@ class BookingManager:
             f"Today is {today.strftime('%A, %B %d, %Y')}.\n\n"
             "CRITICAL RULES:\n"
             "- FIRST, populate the 'reasoning' field to explain your thought process.\n"
-            "- Look at the CONVERSATION HISTORY to understand context.\n"
+            "- Look at the FULL CONVERSATION HISTORY to understand context.\n"
             "- If the user says '2' after being asked 'How many people?', then party_size is 2.\n"
             "- Phrases like 'me and my friend' count as party_size=2.\n"
-            "- Phrases like 'just me' count as party_size=1.\n"
-            "- Phrases like 'couple' count as party_size=2.\n"
-            "- If information was provided in previous messages, INCLUDE IT in the output.\n\n"
+            "- If information was provided in previous messages, INCLUDE IT in the output if it's still relevant.\n"
+            "- DO NOT return null for a field if you can find the information earlier in the conversation, unless the user explicitly changed it.\n\n"
             "DATE PARSING:\n"
             f'- "tonight"/"today" -> {dates["today"].strftime("%Y-%m-%d")}\n'
             f'- "tomorrow" -> {dates["tomorrow"].strftime("%Y-%m-%d")}\n'
-            f'- "saturday" -> {dates["saturday"].strftime("%Y-%m-%d")}\n'
-            f'- "friday" -> {dates["friday"].strftime("%Y-%m-%d")}\n'
-            f'- "sunday" -> {dates["sunday"].strftime("%Y-%m-%d")}\n'
-            f'- "monday" -> {dates["monday"].strftime("%Y-%m-%d")}\n'
             '- Any other day name -> find next occurrence\n\n'
             "CRITICAL - EXTRACTION RULES:\n"
-            "- Extract ONLY fields that are explicitly mentioned or strongly implied in the current turn.\n"
-            "- If the user just provides a time (e.g., '11am'), extract only time, NOT date.\n"
-            "- For fields NOT mentioned: return None/null. The system will preserve existing values.\n"
-            "- EXCEPTION: If user says 'change to X' or 'actually Y', extract the new value even if field was previously set.\n"
+            "- If the user provides a time (e.g., '11am'), extract only time, NOT date, unless date is also mentioned.\n"
+            "- Use the 'reasoning' field to explain if you are pulling information from history or from the current message.\n"
             "CONFLICT RESOLUTION (CRITICAL):\n"
-            "- If the input contains self-corrections (e.g. 'Table for 5, actually 6', 'Saturday... no wait, Sunday', 'I meant today'), ALWAYS extract the FINAL intention.\n"
-            "- Use the 'reasoning' field to explain the correction (e.g. 'User initially said 5 but corrected to 6').\n"
-            "- IF YOU DETECT A CORRECTION, YOU MUST OUTPUT THE NEW VALUE. Do not return null for that field.\n"
-            f"- Example: User says 'I meant today'. Reasoning: 'User corrected date to today'. Output: {{{{ 'date': '{dates['today'].strftime('%Y-%m-%d')}' }}}}\n"
+            "- If the input contains self-corrections (e.g. 'Table for 5, actually 6'), ALWAYS extract the FINAL intention.\n"
             "TIME PARSING:\n"
-            '- "6:30 pm" -> "18:30"\n'
-            '- "2 pm" -> "14:00"\n'
-            '- "9:30" or "nine thirty" WITHOUT am/pm -> Context matters:\n'
-            '  * If user is booking dinner/evening -> assume PM (21:30)\n'
-            '  * Restaurants typically don\'t open at 9:30 AM, so default to PM\n'
-            '  * Use the reasoning field to explain your interpretation\n'
-            '- "7" alone -> "19:00" (dinner context - 7 PM)\n'
-            '- DO NOT AUTOCORRECT times to match opening hours. If user says "11am", output "11:00". The system will validate.\n\n'
+            '- Restaurants typically open for dinner at 5 PM. If user says "7" or "seven", assume "19:00" (7 PM).\n\n'
             "{format_instructions}")
         
     
@@ -104,8 +87,8 @@ class BookingManager:
         max_retries = 1
         for attempt in range(max_retries + 1):
             try:
-                # Setup Pydantic parser
-                parser = PydanticOutputParser(pydantic_object=BookingUpdate)
+                # Use a more flexible way to extract JSON from the LLM output
+                # Instead of just the parser, we'll try to find JSON in the response
                 
                 # Build prompt dynamically with current date context
                 prompt = ChatPromptTemplate.from_messages([
@@ -115,9 +98,11 @@ class BookingManager:
                 ])
                 
                 # Inject format instructions
+                parser = PydanticOutputParser(pydantic_object=BookingUpdate)
                 prompt = prompt.partial(format_instructions=parser.get_format_instructions())
                 
-                chain = prompt | self.llm | parser
+                # Use the raw LLM call first to allow for manual cleaning if needed
+                chain = prompt | self.llm
                 
                 # Use recent history for context (last 5 messages), excluding the current user message
                 history_context = chat_history[:-1][-5:] if chat_history else []
@@ -127,49 +112,46 @@ class BookingManager:
                 if attempt > 0:
                     input_text += f"\n\nSYSTEM: Your previous output was invalid. Please ensure valid JSON format matching schema."
 
-                result: BookingUpdate = await chain.ainvoke({
+                response = await chain.ainvoke({
                     "input": input_text,
                     "history": history_context
                 })
                 
+                content = response.content
+                
+                # CLEANING LOGIC: Try to find JSON block in the response
+                # This handles cases where the LLM adds "Reasoning: ..." before the JSON
+                json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                if json_match:
+                    content = json_match.group(0)
+                
+                # Parse the (potentially cleaned) content
+                result: BookingUpdate = parser.parse(content)
+                
                 # Update slot with extracted information
                 if result.party_size is not None:
-                    # Intelligence Check:
-                    # If party_size changes abruptly (e.g., from 7 to 1) without explicit correction,
-                    # it might be a misunderstanding of "Me" (could mean 'add me' or 'just me').
-                    # For now, we trust the LLM reasoning, but we log it.
                     if current_slot.party_size and current_slot.party_size != result.party_size:
                         logger.info(f"Party size update detected: {current_slot.party_size} -> {result.party_size}")
-                    
                     current_slot.party_size = result.party_size
                 
-                # Logic to prevent date overwriting with defaults
                 if result.date:
                     if current_slot.date and current_slot.date != result.date:
                          logger.info(f"Date update detected: {current_slot.date} -> {result.date}")
-                    # Only update if the result.date is different from current or if we had none
                     current_slot.date = result.date
                 
                 if result.time:
-                    # Validate common format issues from LLM
                     try:
-                        # sometimes LLM extracts '14:00' correctly, sometimes converts to '2:00 PM'
-                        # enforce 24h format if it slipped through
                         t = result.time.lower().strip()
+                        final_time_str = result.time
                         if "pm" in t or "am" in t:
                             if ":" in t:
                                 t_dt = datetime.strptime(t, "%I:%M %p")
                             else:
-                                # Handle "2 pm" without minutes
                                 t_dt = datetime.strptime(t, "%I %p")
-                            current_slot.time = t_dt.strftime("%H:%M")
+                            final_time_str = t_dt.strftime("%H:%M")
                         elif ":" not in t and t.isdigit():
-                             # Handle "14" -> "14:00"
-                             current_slot.time = f"{int(t):02d}:00"
-                        else:
-                            final_time_str = result.time
+                             final_time_str = f"{int(t):02d}:00"
                             
-                        # Compare logic
                         if current_slot.time and current_slot.time != final_time_str:
                              logger.info(f"Time update detected: {current_slot.time} -> {final_time_str}")
                              
@@ -178,14 +160,9 @@ class BookingManager:
                         logger.warning(f"Time parsing fallback failed for '{result.time}': {e}")
                         current_slot.time = result.time
                 
-                # NAME VALIDATION: Only update name if it seems intentional
-                # Avoid overwriting with companion names (e.g., "me and Echo" shouldn't set name to "Echo")
                 if result.name:
-                    # Check if this looks like a booking name vs. a mentioned companion
-                    # Heuristic: Don't overwrite if message contains "and" + the extracted name (likely a companion)
                     user_msg_lower = user_message.lower()
                     name_lower = result.name.lower()
-                    
                     is_companion_mention = (
                         (" and " + name_lower in user_msg_lower) or 
                         (name_lower + " and " in user_msg_lower)
@@ -204,16 +181,12 @@ class BookingManager:
                 logger.info(f"Reasoning: {result.reasoning}")
                 logger.info(f"Updated booking slot: {current_slot}")
                 
-                # If successful, break loop
                 break
                 
             except Exception as e:
                 logger.warning(f"Failed to extract info (attempt {attempt+1}): {e}")
-                
                 if attempt == max_retries:
                     logger.error("All extraction attempts failed.")
-                    # Fallback for simple cases if JSON parsing fails heavily
-                    pass
         
 
         return current_slot
@@ -236,20 +209,23 @@ class BookingManager:
 
     async def _generate_success_response(self, slot: BookingSlot, user_message: str) -> str:
         """Generate a natural success/confirmation message, addressing any side questions."""
+        
+        notes_str = f"Notes/Requests: {slot.notes}" if slot.notes else "Notes: None"
+        
         system_prompt = (
             "You are Bella, the warm and charming hostess at Bella Cucina, an authentic Italian restaurant.\n"
             "We have all the details needed to make a reservation.\n"
             f"Requested Booking: Table for {slot.party_size} on {slot.date} at {slot.time} under the name {slot.name}.\n"
+            f"{notes_str}\n"
             f"User's Last Message: \"{user_message}\"\n\n"
             "TASK: Ask the user to CONFIRM they want to proceed with this booking.\n"
             "CRITICAL RULES:\n"
             "1. PERSONA: Be warm, professional, but not robotic. A tiny bit of Italian flair is okay (e.g. 'Eccellente').\n"
-            "2. DO NOT say 'we have booked' or 'reservation confirmed' - IT IS NOT YET CONFIRMED.\n"
-            "3. Present the details and ask 'Shall I confirm this booking?' or 'Would you like me to book this?'\n"
-            "4. SIDE QUESTIONS: If the user asked a question in their last message (e.g. 'parking?', 'vegan?'), ANSWER IT FIRST briefly.\n"
-            "5. AVOID REPETITION: If the conversation history shows you already presented the details, just ask 'Ready to confirm?' briefly.\n"
+            "2. CONFIRM DETAILS: Explicitly mention the date, time, party size, and name.\n"
+            "3. CONFIRM NOTES: If there are notes (e.g., 'quiet table', 'vegan menu'), YOU MUST MENTION THEM to confirm you heard them. Example: '...and I've noted your request for a quiet table.'\n"
+            "4. DO NOT say 'we have booked' yet - ask 'Shall I confirm this booking?' or similar.\n"
+            "5. SIDE QUESTIONS: If the user asked a question in their last message, ANSWER IT FIRST briefly.\n"
             "6. STYLE: Conversational, warm, short (1-2 sentences).\n"
-            "7. Example: 'I have a table for 4 on Friday at 7 PM under John. Shall I confirm?'"
         )
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
@@ -436,21 +412,20 @@ class BookingManager:
             f"User's Last Message: \"{user_input_context}\"\n\n"
             "TASK: Generate the response to the user.\n"
             "CRITICAL RULES:\n"
-            "1. SIDE QUESTIONS: CHECK if the user explicitly asked a question in their last message (e.g. 'Do you have parking?', 'Is it vegan?').\n"
-            "   - IF AND ONLY IF they asked, answer it first briefly.\n"
-            "   - EXAMPLES of answers (only use if asked):\n"
-            "     - Parking: 'Yes, we have valet.'\n"
-            "     - Vegan: 'Yes, we have a separate vegan menu.'\n"
-            "   - IF NO QUESTION detected, DO NOT invent an answer.\n"
-            "2. THEN ASK FOR MISSING INFO: After answering (if needed), ask for the missing details naturally.\n"
+            "1. SIDE QUESTIONS & SUGGESTIONS: Check if the user asked a question or for a recommendation (e.g. 'What's a good time?', 'Is it vegan?').\n"
+            "   - ANSWER or SUGGEST first. If they ask for a 'good time', suggest something popular like 7:00 PM or 7:30 PM.\n"
+            "   - EXAMPLES:\n"
+            "     - 'What's a good time?': 'I'd recommend around 7:00 PM for a lively dinner atmosphere. Does that work for you?'\n"
+            "     - 'Do you have parking?': 'Yes, we have valet parking available. What time would you like to arrive?'\n"
+            "   - IF NO QUESTION/REQUEST detected, just ask for missing info.\n"
+            "2. THEN ASK FOR MISSING INFO: After addressing the user's point, ask for any remaining missing details naturally.\n"
             "3. SPECIFIC MISSING INFO RULES:\n"
             "   - 'party_size': Ask for number of guests.\n"
             "   - 'date': Ask when they would like to come.\n"
             "   - 'time': Ask for preferred time. (Weekends: Open 12-11 PM, Weekdays: 5-11 PM).\n"
             "   - 'name': Ask for booking name.\n"
-            "4. STYLE: Conversational, warm, short (1-2 sentences). Don't repeat info we have.\n"
-            "5. Example: 'Now, how many guests will be joining you?'"
-            "6. Answer only as much as asked oir needed to be asked do not extend queries beyond that."
+            "4. STYLE: Conversational, warm, short (1-2 sentences). Don't repeat info we already have.\n"
+            "5. Answer naturally, addressing the user's last message first."
         )
         
         prompt = ChatPromptTemplate.from_messages([

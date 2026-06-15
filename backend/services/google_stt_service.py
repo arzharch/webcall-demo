@@ -220,23 +220,8 @@ class STTFallbackService:
         """
         from services.stt_service import STTService
         
-        # Try Deepgram first
-        logger.info("Attempting Deepgram STT connection...")
-        deepgram_stt = STTService(
-            on_speech_start=self.on_speech_start,
-            on_final_transcript=self.on_final_transcript,
-            on_interim_transcript=self.on_interim_transcript,
-        )
-        
-        connected = await deepgram_stt.connect(max_retries=2)
-        if connected:
-            self._active_service = deepgram_stt
-            self._provider = "deepgram"
-            logger.info("✅ Using Deepgram STT")
-            return True, "deepgram"
-        
-        # Fallback to Google Cloud STT
-        logger.warning("Deepgram failed, falling back to Google Cloud STT...")
+        # User requested Google STT priority for better accent recognition
+        logger.info("Attempting Google Cloud STT connection (Primary)...")
         google_stt = GoogleSTTService(
             on_speech_start=self.on_speech_start,
             on_final_transcript=self.on_final_transcript,
@@ -247,8 +232,23 @@ class STTFallbackService:
         if connected:
             self._active_service = google_stt
             self._provider = "google"
-            logger.info("✅ Using Google Cloud STT (fallback)")
+            logger.info("✅ Using Google Cloud STT (Primary)")
             return True, "google"
+        
+        # Fallback to Deepgram
+        logger.warning("Google STT failed, falling back to Deepgram...")
+        deepgram_stt = STTService(
+            on_speech_start=self.on_speech_start,
+            on_final_transcript=self.on_final_transcript,
+            on_interim_transcript=self.on_interim_transcript,
+        )
+        
+        connected = await deepgram_stt.connect(max_retries=2)
+        if connected:
+            self._active_service = deepgram_stt
+            self._provider = "deepgram"
+            logger.info("✅ Using Deepgram STT (Fallback)")
+            return True, "deepgram"
         
         logger.error("❌ All STT providers failed")
         return False, "none"

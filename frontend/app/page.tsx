@@ -54,7 +54,7 @@ export default function HomePage() {
   const handleNameChange = useCallback((value: string) => {
     const sanitized = sanitizeInput(value);
     setCallerName(sanitized);
-    
+
     if (sanitized.length === 0) {
       setNameError(undefined);
       setIsReady(false);
@@ -95,14 +95,14 @@ export default function HomePage() {
 
   return (
     <main className="min-h-screen bg-stone-50 text-stone-900 flex flex-col items-center justify-center p-4 selection:bg-red-100 pattern-grid">
-      
+
       {/* Main Container */}
       <div className="w-full max-w-md animate-fade-in flex flex-col gap-6 relative z-10">
-        
+
         {/* Header - Restaurant Branding */}
         <header className="text-center font-serif">
           <div className="inline-block p-1 border-b-2 border-red-600 mb-3">
-             <h1 className="text-5xl font-bold text-stone-800 tracking-tighter font-serif italic drop-shadow-sm">
+            <h1 className="text-5xl font-bold text-stone-800 tracking-tighter font-serif italic drop-shadow-sm">
               Bella Cucina
             </h1>
           </div>
@@ -116,7 +116,7 @@ export default function HomePage() {
           {/* Decorative Corner accent - subtle vine/organic shape */}
           <div className="absolute -top-12 -right-12 w-40 h-40 bg-green-50 rounded-full blur-3xl opacity-60 pointer-events-none" />
           <div className="absolute -bottom-12 -left-12 w-40 h-40 bg-red-50 rounded-full blur-3xl opacity-60 pointer-events-none" />
-          
+
           {/* Status Bar */}
           <div className="flex items-center justify-between mb-8 relative z-10">
             <StatusIndicator
@@ -128,32 +128,32 @@ export default function HomePage() {
 
           {/* Visualization Area */}
           <div className="h-32 mb-8 flex flex-col items-center justify-center bg-stone-50/50 rounded-xl border border-stone-100 overflow-hidden relative">
-             
-             {/* Hint when idle */}
-             {!isConnected && status !== 'error' && (
-               <div className="absolute top-4 w-full text-center z-20">
-                 <span className="text-stone-400 text-[10px] font-bold tracking-widest uppercase">
-                   Ready to connect
-                 </span>
-               </div>
-             )}
 
-             {/* Waveform Visualization */}
-             <div className="w-full h-full flex items-end justify-center pb-2">
-                <Waveform
-                  isActive={isConnected}
-                  getAnalyserNode={getAnalyserNode}
-                  barCount={20} // Fewer bars, thicker = cleaner look
-                />
-             </div>
+            {/* Hint when idle */}
+            {!isConnected && status !== 'error' && (
+              <div className="absolute top-4 w-full text-center z-20">
+                <span className="text-stone-400 text-[10px] font-bold tracking-widest uppercase">
+                  Ready to connect
+                </span>
+              </div>
+            )}
+
+            {/* Waveform Visualization */}
+            <div className="w-full h-full flex items-end justify-center pb-2">
+              <Waveform
+                isActive={isConnected}
+                getAnalyserNode={getAnalyserNode}
+                barCount={20} // Fewer bars, thicker = cleaner look
+              />
+            </div>
           </div>
 
           {/* Name Input - only show when not in call */}
           {!isInCall && (
             <div className="mb-6 animate-fade-in relative z-10">
-               <label className="block text-[10px] font-bold text-stone-400 mb-2 ml-1 uppercase tracking-widest">
-                 Your Name
-               </label>
+              <label className="block text-[10px] font-bold text-stone-400 mb-2 ml-1 uppercase tracking-widest">
+                Your Name
+              </label>
               <NameInput
                 value={callerName}
                 onChange={handleNameChange}
@@ -180,9 +180,9 @@ export default function HomePage() {
               disabled={!canStartCall && status === "idle"}
             />
             {status === "idle" && (
-                <span className="text-xs text-stone-400 font-medium mt-2">
-                    {canStartCall ? "Tap to Call Reservation Desk" : "Please enter name first"}
-                </span>
+              <span className="text-xs text-stone-400 font-medium mt-2">
+                {canStartCall ? "Tap to Call Reservation Desk" : "Please enter name first"}
+              </span>
             )}
           </div>
 
@@ -210,12 +210,12 @@ export default function HomePage() {
         )}
 
         <footer className="text-center mt-4">
-            <p className="text-stone-400 text-xs font-semibold uppercase tracking-widest mb-1">
-                Voice Technology by
-            </p>
-            <p className="text-stone-600 font-bold text-sm">
-                Synthion AI
-            </p>
+          <p className="text-stone-400 text-xs font-semibold uppercase tracking-widest mb-1">
+            Voice Technology by
+          </p>
+          <p className="text-stone-600 font-bold text-sm">
+
+          </p>
         </footer>
       </div>
     </main>
