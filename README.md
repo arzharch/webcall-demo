@@ -8,13 +8,22 @@ The system is designed with an advanced streaming architecture focusing on modul
 
 ![System Architecture](docs/architecture.svg)
 
+### Request Lifecycle & Streaming Flow
+The diagram below illustrates the exact step-by-step sequence of how a user's voice request is processed. Notice how the **API Layer** acts as the central mediator, routing audio chunks to the Speech Pipeline and text to the LangChain "Brain".
+
+![Request Flow](docs/request_flow.svg)
+
 ### Key Technologies & Why We Use Them
 
 - **FastAPI**: Provides a high-performance REST API for session management and native WebSocket support for real-time audio streaming.
 - **LangChain & LCEL**: Powers the "Brain" of the bot. LangChain Expression Language (LCEL) allows us to build declarative, modular routing chains to classify user intents and seamlessly call external tools.
 - **Google Gemini 2.0 Flash**: Acts as the core LLM. Chosen for its extreme speed, advanced reasoning capabilities, and excellent function-calling reliability.
-- **Faster-Whisper (STT)**: A highly optimized transcription model running locally on CPU/INT8. Combined with Voice Activity Detection (VAD), it ensures low-latency speech recognition.
-- **Coqui XTTS v2 (TTS)**: An open-source text-to-speech engine capable of high-quality streaming synthesis, allowing the bot to start speaking before the full sentence is generated.
+- **Deepgram (STT)**: Deepgram's Nova-2 model is used for ultra-low latency, real-time Speech-to-Text transcription. Combined with Voice Activity Detection (VAD), it supports natural interruptions and barge-ins.
+- **Google Cloud Text-to-Speech (TTS)**: Used for high-quality, reliable streaming voice synthesis.
+- **Infrastructure & Observability Layer**:
+  - **Redis Cache & Rate Limiting**: Redis is heavily utilized for caching repeated TTS phrases to cut down latency, as well as for robust rate-limiting and connection management across sessions.
+  - **Circuit Breakers**: Ensures fault tolerance across API calls and external services.
+  - **OpenTelemetry & Token Tracking**: The system is fully instrumented with OpenTelemetry for detailed observability and distributed tracing. Additionally, an integrated token and cost tracker counts every LLM interaction to aggressively manage and monitor costs.
 - **FAISS & SQLite**: FAISS is used for fast local vector retrieval (RAG) of menu items and FAQs, while SQLite manages structured reservation data.
 - **Next.js & React**: Powers the frontend interface, offering a robust and responsive web client for users to initiate voice calls.
 
